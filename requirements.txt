@@ -1,10 +1,13 @@
---extra-index-url https://download.pytorch.org/whl/cpu 
-torch==2.5.1+cpu
+# GNSS Spoofing Detection — Streamlit Cloud deployment
+# Python 3.10 required (set in .python-version file)
 
-numpy==2.2.6
-pandas==2.3.3
-scikit-learn==1.7.2
-scipy==1.15.3
-joblib
-streamlit==1.56.0
-plotly
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+scipy==1.13.0
+joblib==1.4.2
+streamlit==1.35.0
+plotly==5.22.0
