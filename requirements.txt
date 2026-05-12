@@ -2,7 +2,7 @@
 streamlit>=1.35.0
 
 # ── Machine learning ──────────────────────────────────────────────
-scikit-learn==1.3.0       # Must match the version used to train best_model.pkl
+scikit-learn==1.5.0       # Must match the version used to train best_model.pkl
 joblib>=1.3.0
 
 # ── Deep learning ─────────────────────────────────────────────────
