@@ -1,16 +1,10 @@
-# ── Core framework ────────────────────────────────────────────────
-streamlit>=1.35.0
+--extra-index-url https://download.pytorch.org/whl/cpu 
+torch==2.5.1+cpu
 
-# ── Machine learning ──────────────────────────────────────────────
-scikit-learn==1.5.0       # Must match the version used to train best_model.pkl
-joblib>=1.3.0
-
-# ── Deep learning ─────────────────────────────────────────────────
-torch>=2.0.0,<3.0.0       # CPU build is fine for inference
-
-# ── Data handling ─────────────────────────────────────────────────
-numpy>=1.24.0
-pandas>=2.0.0
-
-# ── Visualisation ─────────────────────────────────────────────────
-plotly>=5.18.0
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+scipy==1.15.3
+joblib
+streamlit==1.56.0
+plotly
