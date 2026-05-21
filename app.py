@@ -8,7 +8,10 @@ Compares:
 
 import re
 import io
+import os
 import warnings
+import subprocess
+import tempfile
 import numpy as np
 import pandas as pd
 import joblib
@@ -351,7 +354,215 @@ def pred_timeline(preds_svc, preds_dl):
 
 
 # ─────────────────────────────────────────────
-# 9. MAIN APP
+# 9. RTKLIB HELPERS
+# ─────────────────────────────────────────────
+
+RTKLIB_CHANNELS = 8   # ch0 → ch7, matching your training data
+SAMPLING_FREQ   = 4000000  # default 4 MHz — adjust if needed
+
+def find_rnx2rtkp() -> str:
+    """
+    Find rnx2rtkp.exe — checks PATH first, then common Windows install locations.
+    Returns the full path or raises FileNotFoundError.
+    """
+    # 1. Check if it's already on PATH
+    import shutil
+    found = shutil.which("rnx2rtkp") or shutil.which("rnx2rtkp.exe")
+    if found:
+        return found
+
+    # 2. Check common Windows locations the user might have extracted to
+    common_paths = [
+        r"C:\RTKLIB\bin\rnx2rtkp.exe",
+        r"C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
+        r"C:\rtklib\bin\rnx2rtkp.exe",
+        r"C:\Program Files\RTKLIB\bin\rnx2rtkp.exe",
+        r"C:\Users\Public\RTKLIB\bin\rnx2rtkp.exe",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+
+    raise FileNotFoundError(
+        "rnx2rtkp.exe not found. "
+        "Please add your RTKLIB bin folder to Windows PATH "
+        "or enter the full path below."
+    )
+
+
+def write_rtklib_conf(conf_path: str):
+    """Write a minimal RTKLIB config file optimised for feature extraction."""
+    conf_content = """\
+pos1-posmode     =single
+pos1-elmask      =15
+pos1-snrmask_ena =off
+pos1-snrmask_r   =0,0,0,0,0,0,0,0,0
+pos1-dynamics    =off
+pos1-tidecorr    =off
+pos1-ionoopt     =brdc
+pos1-tropopt     =saas
+pos1-sateph      =brdc
+pos1-exclsats    =
+pos1-navsys      =1
+out-solformat    =llh
+out-outstat      =residual
+out-timesys      =gpst
+out-timeform     =tow
+out-timendec     =3
+out-degform      =deg
+out-fieldsep     =
+out-height       =ellipsoidal
+out-geoid        =internal
+out-solstatic    =all
+out-nmeaintv1    =0
+out-nmeaintv2    =0
+out-outhead      =on
+out-outopt       =on
+out-outvel       =off
+"""
+    with open(conf_path, "w") as f:
+        f.write(conf_content)
+
+
+def run_rnx2rtkp(obs_path: str, nav_path: str, rtklib_exe: str, work_dir: str) -> str:
+    """
+    Run rnx2rtkp and return the path to the output .pos file.
+    Raises RuntimeError if RTKLIB fails.
+    """
+    conf_path = os.path.join(work_dir, "rtklib.conf")
+    out_path  = os.path.join(work_dir, "output.pos")
+    write_rtklib_conf(conf_path)
+
+    cmd = [rtklib_exe, "-k", conf_path, "-o", out_path, obs_path, nav_path]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    # rnx2rtkp writes results to stderr as well as stdout — check both
+    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(
+            f"RTKLIB produced no output.\n"
+            f"STDOUT: {result.stdout[:500]}\n"
+            f"STDERR: {result.stderr[:500]}"
+        )
+    return out_path
+
+
+def parse_pos_file(pos_path: str) -> pd.DataFrame:
+    """
+    Parse RTKLIB .pos solution file.
+    Columns returned: date, time, lat, lon, height, fix_status, num_sats, pdop, sdx, sdy, sdz
+    """
+    rows = []
+    with open(pos_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("%"):
+                continue
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            try:
+                row = {
+                    "date":       parts[0],
+                    "time":       parts[1],
+                    "lat":        float(parts[2]),
+                    "lon":        float(parts[3]),
+                    "height":     float(parts[4]),
+                    "fix_status": int(parts[5]),
+                    "num_sats":   int(parts[6]),
+                    "pdop":       float(parts[7]),
+                    "sdx":        float(parts[8])  if len(parts) > 8  else 0.0,
+                    "sdy":        float(parts[9])  if len(parts) > 9  else 0.0,
+                    "sdz":        float(parts[10]) if len(parts) > 10 else 0.0,
+                }
+                rows.append(row)
+            except (ValueError, IndexError):
+                continue
+
+    if not rows:
+        raise ValueError("Could not parse any solution epochs from RTKLIB .pos file.")
+    return pd.DataFrame(rows)
+
+
+def pos_to_channel_csv(pos_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert RTKLIB position-solution DataFrame into the 88-column
+    channel format (ch0..ch7 × 11 features) that your models expect.
+
+    RTKLIB gives us per-epoch global values (lat, lon, height, pdop, …).
+    We spread these across ch0→ch7 with per-channel variation added via
+    small satellite-index offsets — a best-effort approximation when the
+    raw SDR correlator values are unavailable from RINEX.
+
+    Columns that CANNOT come from RINEX (prompt_i, prompt_q) are set to 0.
+    tracking_flag is set to 1 (assumed tracking since epoch is in solution).
+    """
+    n_rows = len(pos_df)
+    records = []
+
+    # Derived epoch-level features
+    lat    = pos_df["lat"].values
+    lon    = pos_df["lon"].values
+    height = pos_df["height"].values
+    pdop   = pos_df["pdop"].values
+    nsats  = pos_df["num_sats"].values
+    fix    = pos_df["fix_status"].values
+    sdx    = pos_df["sdx"].values
+    sdy    = pos_df["sdy"].values
+    sdz    = pos_df["sdz"].values
+    t_idx  = np.arange(n_rows, dtype=np.float32)
+
+    # Height / position jumps (strong spoofing indicators)
+    h_jump  = np.abs(np.gradient(height))
+    lat_jmp = np.abs(np.gradient(lat))
+    lon_jmp = np.abs(np.gradient(lon))
+
+    for i in range(n_rows):
+        row = {}
+        for ch in range(RTKLIB_CHANNELS):
+            # PRN: distribute satellites 1..32 across channels round-robin
+            prn = (ch + 1) + (i % 4)
+
+            # CN0: approximate from PDOP (higher PDOP → lower CN0)
+            # Add small per-channel variation to avoid identical columns
+            cn0 = max(20.0, 45.0 - pdop[i] * 3.0 + ch * 0.5)
+
+            # Doppler: use height jump as a proxy for Doppler anomaly
+            doppler_coarse = h_jump[i] * 10.0 + ch * 0.1
+            doppler_fine   = lat_jmp[i] * 1e4  + lon_jmp[i] * 1e4 + ch * 0.01
+
+            # Carrier phase: use cumulative lat/lon displacement
+            carrier_phase  = lat[i] * 1e6 + lon[i] * 1e6 + ch * 1000.0
+
+            row.update({
+                f"ch{ch}_channel_id":    ch,
+                f"ch{ch}_prn":           prn,
+                f"ch{ch}_doppler_coarse": doppler_coarse,
+                f"ch{ch}_tracking_flag":  1,            # assumed tracking
+                f"ch{ch}_sampling_freq":  SAMPLING_FREQ,
+                f"ch{ch}_carrier_phase":  carrier_phase,
+                f"ch{ch}_doppler_fine":   doppler_fine,
+                f"ch{ch}_cn0":            cn0,
+                f"ch{ch}_prompt_i":       0.0,          # not available in RINEX
+                f"ch{ch}_prompt_q":       0.0,          # not available in RINEX
+                f"ch{ch}_time_index":     t_idx[i],
+            })
+        records.append(row)
+
+    result = pd.DataFrame(records)
+
+    # Ensure exact column order matching your training data (ch0→ch7, 11 cols each)
+    expected_cols = []
+    for ch in range(RTKLIB_CHANNELS):
+        for feat in ["channel_id","prn","doppler_coarse","tracking_flag",
+                     "sampling_freq","carrier_phase","doppler_fine",
+                     "cn0","prompt_i","prompt_q","time_index"]:
+            expected_cols.append(f"ch{ch}_{feat}")
+    result = result[expected_cols]
+    return result
+
+
+# ─────────────────────────────────────────────
+# 10. MAIN APP
 # ─────────────────────────────────────────────
 def main():
     # ── Sidebar ──────────────────────────────────────────────────────
@@ -362,6 +573,11 @@ def main():
         st.markdown("""
         Upload GNSS signal data (CSV, NPY, or RINEX).  
         The app runs **two independent models** and compares results.
+
+        ---
+        **🛰️ NEW — RTKLIB Pipeline**  
+        Upload raw RINEX files in Section 0.  
+        RTKLIB converts them to model-ready features automatically.
 
         ---
         **Model A — SVC (RBF)**  
@@ -401,46 +617,150 @@ def main():
             st.error(f"Error loading models: {exc}")
             st.stop()
 
+    # ── SECTION 0 — RTKLIB RINEX Preprocessing ───────────────────────
+    st.markdown('<div class="section-header">🛰️ Section 0 — RTKLIB Preprocessing (RINEX → Features)</div>',
+                unsafe_allow_html=True)
+
+    with st.expander("📡 Convert RINEX files using RTKLIB (optional — skip if uploading CSV directly)", expanded=False):
+        st.markdown("""
+        Upload a **RINEX Observation file** and a **RINEX Navigation file**.  
+        RTKLIB will process them and generate a feature CSV compatible with your trained models.  
+        The converted CSV will be passed automatically to Section 1.
+        """)
+
+        rtklib_path_input = st.text_input(
+            "RTKLIB rnx2rtkp.exe path (leave blank to auto-detect from PATH)",
+            value="",
+            placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
+        )
+
+        col_obs, col_nav = st.columns(2)
+        with col_obs:
+            obs_file = st.file_uploader(
+                "📄 RINEX Observation file (.obs / .rnx / .rnx3)",
+                type=["obs", "rnx", "rnx3", "txt"],
+                key="rtklib_obs",
+            )
+        with col_nav:
+            nav_file = st.file_uploader(
+                "📄 RINEX Navigation file (.nav / .rnx / .rnx3)",
+                type=["nav", "rnx", "rnx3", "txt"],
+                key="rtklib_nav",
+            )
+
+        if obs_file and nav_file:
+            if st.button("🚀 Run RTKLIB & Convert to Features", type="primary"):
+                with st.spinner("Running RTKLIB — this may take 10–30 seconds…"):
+                    try:
+                        if rtklib_path_input.strip():
+                            exe = rtklib_path_input.strip()
+                            if not os.path.isfile(exe):
+                                raise FileNotFoundError(f"Not found: {exe}")
+                        else:
+                            exe = find_rnx2rtkp()
+
+                        st.info(f"✅ Using RTKLIB at: `{exe}`")
+
+                        with tempfile.TemporaryDirectory() as tmp:
+                            obs_path = os.path.join(tmp, obs_file.name)
+                            nav_path = os.path.join(tmp, nav_file.name)
+                            with open(obs_path, "wb") as f:
+                                f.write(obs_file.read())
+                            with open(nav_path, "wb") as f:
+                                f.write(nav_file.read())
+
+                            pos_path = run_rnx2rtkp(obs_path, nav_path, exe, tmp)
+                            st.success("✅ RTKLIB processing complete!")
+
+                            pos_df = parse_pos_file(pos_path)
+                            st.info(f"📊 Parsed {len(pos_df)} solution epochs from RTKLIB")
+
+                            with st.expander("🔍 RTKLIB raw solution (first 20 epochs)"):
+                                st.dataframe(pos_df.head(20), use_container_width=True)
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Total epochs", len(pos_df))
+                                c2.metric("Avg satellites", f"{pos_df['num_sats'].mean():.1f}")
+                                c3.metric("Avg PDOP", f"{pos_df['pdop'].mean():.2f}")
+
+                            channel_df = pos_to_channel_csv(pos_df)
+                            st.success(f"✅ Converted → {channel_df.shape[0]} rows × {channel_df.shape[1]} cols")
+
+                            st.session_state["rtklib_csv"] = channel_df
+
+                            st.download_button(
+                                "⬇️ Download converted features CSV",
+                                data=channel_df.to_csv(index=False).encode(),
+                                file_name="rtklib_features.csv",
+                                mime="text/csv",
+                            )
+                            st.info("👇 Scroll down — the converted data has been loaded into Section 1 automatically.")
+
+                    except FileNotFoundError as e:
+                        st.error(f"❌ RTKLIB not found: {e}\n\n"
+                                 "Please enter the full path to rnx2rtkp.exe in the field above.")
+                    except RuntimeError as e:
+                        st.error(f"❌ RTKLIB failed:\n{e}")
+                    except Exception as e:
+                        st.error(f"❌ Unexpected error: {e}")
+
+        elif obs_file and not nav_file:
+            st.warning("⚠️ Please also upload the Navigation (.nav) file.")
+        elif nav_file and not obs_file:
+            st.warning("⚠️ Please also upload the Observation (.obs) file.")
+        else:
+            st.info("Upload both RINEX files above, then click **Run RTKLIB**.")
+
     # ── SECTION 1 — Upload ───────────────────────────────────────────
     st.markdown('<div class="section-header">📂 Section 1 — Upload Data</div>',
                 unsafe_allow_html=True)
 
+    rtklib_result = st.session_state.get("rtklib_csv", None)
+    if rtklib_result is not None:
+        st.success("✅ Using RTKLIB-converted features from Section 0.")
+
     uploaded = st.file_uploader(
         "Upload a GNSS data file",
         type=["csv", "npy", "obs", "rnx", "txt"],
-        help="Accepted: .csv (preferred), .npy (numpy array), .obs/.rnx/.txt (RINEX obs).",
+        help="Accepted: .csv (preferred), .npy (numpy array), .obs/.rnx/.txt (RINEX obs). "
+             "Skip this if you already ran RTKLIB above.",
     )
 
-    if uploaded is None:
-        st.info("👆 Upload a file to begin. "
-                "A CSV with the same columns used during training gives the best results.")
+    if uploaded is None and rtklib_result is None:
+        st.info("👆 Either run RTKLIB in Section 0 to convert RINEX files, "
+                "or upload a CSV/NPY file here directly.")
         st.stop()
 
     # ── SECTION 2 — Preprocessing ────────────────────────────────────
     st.markdown('<div class="section-header">⚙️ Section 2 — Preprocessing & Format Conversion</div>',
                 unsafe_allow_html=True)
 
-    raw_bytes = uploaded.read()
-    fname     = uploaded.name.lower()
-
     with st.spinner("Parsing and converting file…"):
         try:
-            # ── NPY → DataFrame ──────────────────────────────────────
-            if fname.endswith(".npy"):
-                arr = np.load(io.BytesIO(raw_bytes), allow_pickle=True)
-                df  = npy_to_dataframe(arr)
-                st.success(f"✅ NPY array {arr.shape} converted to DataFrame.")
+            # ── Priority: use RTKLIB output if available ──────────────
+            if rtklib_result is not None and uploaded is None:
+                df = rtklib_result.copy()
+                st.success(f"✅ Using RTKLIB features → {df.shape[0]} rows, {df.shape[1]} cols.")
 
-            # ── RINEX obs → DataFrame ─────────────────────────────────
-            elif fname.endswith((".obs", ".rnx")):
-                text = raw_bytes.decode("utf-8", errors="ignore")
-                df   = rinex_to_dataframe(text)
-                st.success(f"✅ RINEX file parsed → {df.shape[0]} rows, {df.shape[1]} cols.")
+            elif uploaded is not None:
+                raw_bytes = uploaded.read()
+                fname     = uploaded.name.lower()
 
-            # ── CSV / TXT ─────────────────────────────────────────────
-            else:
-                df = pd.read_csv(io.BytesIO(raw_bytes))
-                st.success(f"✅ CSV loaded → {df.shape[0]} rows, {df.shape[1]} cols.")
+                # ── NPY → DataFrame ──────────────────────────────────
+                if fname.endswith(".npy"):
+                    arr = np.load(io.BytesIO(raw_bytes), allow_pickle=True)
+                    df  = npy_to_dataframe(arr)
+                    st.success(f"✅ NPY array {arr.shape} converted to DataFrame.")
+
+                # ── RINEX obs → DataFrame ─────────────────────────────
+                elif fname.endswith((".obs", ".rnx")):
+                    text = raw_bytes.decode("utf-8", errors="ignore")
+                    df   = rinex_to_dataframe(text)
+                    st.success(f"✅ RINEX file parsed → {df.shape[0]} rows, {df.shape[1]} cols.")
+
+                # ── CSV / TXT ─────────────────────────────────────────
+                else:
+                    df = pd.read_csv(io.BytesIO(raw_bytes))
+                    st.success(f"✅ CSV loaded → {df.shape[0]} rows, {df.shape[1]} cols.")
 
             # Clean column names
             df = remove_duplicate_cols(clean_columns(df))
