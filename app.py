@@ -90,89 +90,84 @@ ALL_MODELS = ML_MODELS + DL_MODELS
 # 3. DEEP LEARNING ARCHITECTURES
 # ═══════════════════════════════════════════════════════════════════════════
 class AttentionBiLSTM(nn.Module):
-    def __init__(self, input_dim=DL_INPUT_DIM, hidden_dim=64, num_layers=2,
+    """Matches saved keys: lstm.*, attention.weight/bias, fc.weight/bias"""
+    def __init__(self, input_dim=DL_INPUT_DIM, hidden_dim=64, num_layers=1,
                  dropout=0.3, num_classes=2):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
-                            batch_first=True, bidirectional=True,
-                            dropout=dropout if num_layers > 1 else 0)
-        self.attn = nn.Linear(hidden_dim * 2, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+        self.lstm      = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
+                                 batch_first=True, bidirectional=True)
+        self.attention = nn.Linear(hidden_dim * 2, 1)   # key: 'attention'
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        w = torch.softmax(self.attn(out), dim=1)
+        w   = torch.softmax(self.attention(out), dim=1)
         ctx = (out * w).sum(dim=1)
         return self.fc(self.dropout(ctx))
 
 
 class CNNLSTMModel(nn.Module):
+    """Matches saved keys: conv1.weight/bias, lstm.*, fc.weight/bias"""
     def __init__(self, input_dim=DL_INPUT_DIM, num_filters=64,
-                 kernel_size=3, hidden_dim=64, num_layers=2,
+                 kernel_size=3, hidden_dim=64, num_layers=1,
                  dropout=0.3, num_classes=2):
         super().__init__()
-        self.conv1 = nn.Conv1d(input_dim, num_filters, kernel_size, padding=1)
-        self.conv2 = nn.Conv1d(num_filters, num_filters * 2, kernel_size, padding=1)
-        self.bn1   = nn.BatchNorm1d(num_filters)
-        self.bn2   = nn.BatchNorm1d(num_filters * 2)
-        self.pool  = nn.MaxPool1d(2)
-        self.relu  = nn.ReLU()
+        self.conv1   = nn.Conv1d(input_dim, num_filters, kernel_size, padding=1)
+        self.relu    = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        self.lstm  = nn.LSTM(num_filters * 2, hidden_dim, num_layers=num_layers,
-                             batch_first=True, bidirectional=True,
-                             dropout=dropout if num_layers > 1 else 0)
-        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+        self.lstm    = nn.LSTM(num_filters, hidden_dim, num_layers=num_layers,
+                               batch_first=True, bidirectional=True)
+        self.fc      = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
+        x = x.permute(0, 2, 1)            # (B, F, T)
+        x = self.relu(self.conv1(x))
         x = self.dropout(x)
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)            # (B, T, F)
         out, _ = self.lstm(x)
         return self.fc(self.dropout(out[:, -1, :]))
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim=DL_INPUT_DIM, d_model=128, nhead=8,
-                 num_layers=3, dim_feedforward=256, dropout=0.1, num_classes=2):
+    """Matches saved keys: input_projection.*, transformer.layers.0/1.*, fc.*"""
+    def __init__(self, input_dim=DL_INPUT_DIM, d_model=64, nhead=4,
+                 num_layers=2, dim_feedforward=128, dropout=0.1, num_classes=2):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_enc    = nn.Parameter(torch.zeros(1, WINDOW, d_model))
+        self.input_projection = nn.Linear(input_dim, d_model)   # key: 'input_projection'
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(d_model, num_classes)
+        self.fc      = nn.Linear(d_model, num_classes)
 
     def forward(self, x):
-        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        x = self.input_projection(x)
         x = self.transformer(self.dropout(x))
         return self.fc(x.mean(dim=1))
 
 
 class TransformerAttentionModel(nn.Module):
-    def __init__(self, input_dim=DL_INPUT_DIM, d_model=128, nhead=8,
-                 num_layers=3, dim_feedforward=256, dropout=0.1, num_classes=2):
+    """Matches saved keys: input_projection.*, transformer.layers.0/1.*, attention.*, fc.*"""
+    def __init__(self, input_dim=DL_INPUT_DIM, d_model=64, nhead=4,
+                 num_layers=2, dim_feedforward=128, dropout=0.1, num_classes=2):
         super().__init__()
-        self.input_proj  = nn.Linear(input_dim, d_model)
-        self.pos_enc     = nn.Parameter(torch.zeros(1, WINDOW, d_model))
+        self.input_projection = nn.Linear(input_dim, d_model)   # key: 'input_projection'
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.attn_pool   = nn.Linear(d_model, 1)
+        self.attention   = nn.Linear(d_model, 1)                 # key: 'attention'
         self.dropout     = nn.Dropout(dropout)
         self.fc          = nn.Linear(d_model, num_classes)
 
     def forward(self, x):
-        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
-        x = self.transformer(self.dropout(x))
-        w = torch.softmax(self.attn_pool(x), dim=1)
+        x   = self.input_projection(x)
+        x   = self.transformer(self.dropout(x))
+        w   = torch.softmax(self.attention(x), dim=1)
         ctx = (x * w).sum(dim=1)
         return self.fc(ctx)
 
