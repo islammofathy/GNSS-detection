@@ -183,7 +183,7 @@ def model_path(filename):
     return os.path.join(BASE_DIR, filename)
 
 @st.cache_resource(show_spinner=False)
-def load_all_models():
+def load_all_models(_version="v3"):   # bump this string to force cache clear
     device = torch.device("cpu")
     models = {}
     errors = {}
@@ -206,28 +206,40 @@ def load_all_models():
     for name, fname, cls in dl_specs:
         path = model_path(fname)
         try:
-            state = torch.load(path, map_location=device, weights_only=True)
-            # Handle both raw state_dict and wrapped checkpoint
-            if isinstance(state, dict) and "model_state_dict" in state:
-                state = state["model_state_dict"]
-            m = cls()
-            if isinstance(state, dict):
-                m.load_state_dict(state, strict=False)
+            # Step 1: load whatever is in the file (disable weights_only so
+            # OrderedDict / legacy formats load without error)
+            raw = torch.load(path, map_location=device, weights_only=False)
+
+            # Step 2: extract the state dict however it was saved
+            if isinstance(raw, dict):
+                if "model_state_dict" in raw:
+                    state_dict = raw["model_state_dict"]
+                elif "state_dict" in raw:
+                    state_dict = raw["state_dict"]
+                else:
+                    state_dict = raw   # assume raw IS the state dict
+            elif hasattr(raw, "state_dict"):
+                # Full model object saved — just use it directly
+                raw.eval()
+                models[name] = raw
+                continue
             else:
-                m = state  # full model saved
+                errors[name] = f"Unknown saved format: {type(raw)}"
+                continue
+
+            # Step 3: instantiate architecture and load weights
+            m = cls()
+            missing, unexpected = m.load_state_dict(state_dict, strict=False)
+            if unexpected:
+                # Only fail if ALL keys are wrong (i.e. completely wrong arch)
+                if len(unexpected) == len(state_dict):
+                    errors[name] = f"All keys unexpected — architecture mismatch. Keys: {list(state_dict.keys())[:5]}"
+                    continue
             m.eval()
             models[name] = m
+
         except Exception as e:
-            # Fallback: try loading as full model
-            try:
-                m = torch.load(path, map_location=device, weights_only=False)
-                if hasattr(m, "eval"):
-                    m.eval()
-                    models[name] = m
-                else:
-                    errors[name] = "Not a valid PyTorch model"
-            except Exception as e2:
-                errors[name] = str(e2)
+            errors[name] = f"{type(e).__name__}: {e}"
 
     return models, errors, device
 
