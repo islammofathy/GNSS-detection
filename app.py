@@ -9,9 +9,13 @@ Compares:
 import re
 import io
 import os
+import gzip
+import shutil
 import warnings
 import subprocess
 import tempfile
+import requests
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import joblib
@@ -354,7 +358,89 @@ def pred_timeline(preds_svc, preds_dl):
 
 
 # ─────────────────────────────────────────────
-# 9. RTKLIB HELPERS
+# 9. NAVIGATION FILE AUTO-DOWNLOADER
+# ─────────────────────────────────────────────
+
+def date_to_doy(year: int, month: int, day: int):
+    """Convert calendar date to day-of-year."""
+    return datetime(year, month, day).timetuple().tm_yday
+
+
+def build_nav_urls(year: int, month: int, day: int) -> list:
+    """
+    Build a list of candidate URLs for the IGS broadcast navigation file
+    (BRDC) for the given date. Tries multiple mirrors in order.
+    """
+    doy   = date_to_doy(year, month, day)
+    yr2   = str(year)[2:]   # e.g. "23"
+    yr4   = year            # e.g. 2023
+
+    # Legacy RINEX 2 nav filename  e.g. brdc2780.23n.gz
+    legacy_name = f"brdc{doy:03d}0.{yr2}n"
+
+    # RINEX 3 mixed nav filename
+    rinex3_name = f"BRDC00IGS_R_{yr4}{doy:03d}0000_01D_MN.rnx"
+
+    mirrors = [
+        # ── CDDIS NASA (most reliable, needs Earthdata but often open) ──
+        f"https://cddis.nasa.gov/archive/gnss/data/daily/{yr4}/{doy:03d}/{yr2}n/{legacy_name}.gz",
+        f"https://cddis.nasa.gov/archive/gnss/data/daily/{yr4}/brdc/{legacy_name}.gz",
+        # ── BKG Germany ──
+        f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{yr4}/{doy:03d}/{rinex3_name}.gz",
+        # ── IGN France ──
+        f"https://igs.ign.fr/pub/igs/data/daily/{yr4}/{doy:03d}/{legacy_name}.gz",
+        f"https://igs.ign.fr/pub/igs/data/daily/{yr4}/{doy:03d}/{legacy_name}.Z",
+        # ── GFZ Germany ──
+        f"https://ftp.gfz-potsdam.de/pub/GNSS/data/daily/{yr4}/{doy:03d}/{legacy_name}.gz",
+        # ── EUREF ──
+        f"https://igs.bkg.bund.de/root_ftp/EUREF/BRDC/{yr4}/{doy:03d}/{rinex3_name}.gz",
+    ]
+    return mirrors, legacy_name
+
+
+def download_nav_file(year: int, month: int, day: int, save_dir: str) -> str:
+    """
+    Try each mirror in order until one succeeds.
+    Decompresses .gz automatically.
+    Returns the path to the decompressed nav file, or raises RuntimeError.
+    """
+    mirrors, legacy_name = build_nav_urls(year, month, day)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RTKLIB/2.4.3",
+        "Accept": "*/*",
+    }
+
+    for url in mirrors:
+        try:
+            resp = requests.get(url, headers=headers, timeout=30, stream=True)
+            if resp.status_code == 200:
+                # Save compressed file
+                gz_path  = os.path.join(save_dir, legacy_name + ".gz")
+                nav_path = os.path.join(save_dir, legacy_name)
+
+                with open(gz_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                # Decompress
+                with gzip.open(gz_path, "rb") as f_in, open(nav_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+                os.remove(gz_path)
+                return nav_path
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "Could not download navigation file from any IGS mirror.\n"
+        "Please download it manually from:\n"
+        "https://cddis.nasa.gov/Data_and_Derived_Products/GNSS/broadcast_ephemeris_data.html\n"
+        "Or ask your supervisor for the .23N file."
+    )
+
+
+# ─────────────────────────────────────────────
+# 10. RTKLIB HELPERS
 # ─────────────────────────────────────────────
 
 RTKLIB_CHANNELS = 8   # ch0 → ch7, matching your training data
@@ -634,23 +720,86 @@ def main():
             placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
         )
 
+        # ── Navigation file auto-downloader ──────────────────────────
+        st.markdown("---")
+        st.markdown("#### 📥 Don't have a Navigation file? Download it automatically")
+        st.markdown("Enter the **date of your Observation file** and we'll download the matching navigation file from IGS:")
+
+        col_y, col_m, col_d = st.columns(3)
+        with col_y:
+            nav_year  = st.number_input("Year",  min_value=2000, max_value=2030, value=2023, step=1)
+        with col_m:
+            nav_month = st.number_input("Month", min_value=1,    max_value=12,   value=10,   step=1)
+        with col_d:
+            nav_day   = st.number_input("Day",   min_value=1,    max_value=31,   value=5,    step=1)
+
+        if st.button("📥 Download Navigation File from IGS", type="secondary"):
+            with st.spinner(f"Downloading navigation file for {int(nav_year)}-{int(nav_month):02d}-{int(nav_day):02d}…"):
+                try:
+                    tmp_nav_dir = tempfile.mkdtemp()
+                    nav_dl_path = download_nav_file(
+                        int(nav_year), int(nav_month), int(nav_day), tmp_nav_dir
+                    )
+                    with open(nav_dl_path, "rb") as f:
+                        nav_bytes = f.read()
+
+                    st.success(f"✅ Navigation file downloaded! ({len(nav_bytes)/1024:.1f} KB)")
+                    st.download_button(
+                        "⬇️ Save Navigation file (.nav) to your PC",
+                        data=nav_bytes,
+                        file_name=os.path.basename(nav_dl_path),
+                        mime="application/octet-stream",
+                    )
+                    # Store in session for use in RTKLIB run
+                    st.session_state["downloaded_nav_bytes"] = nav_bytes
+                    st.session_state["downloaded_nav_name"]  = os.path.basename(nav_dl_path)
+                    st.info("✅ Navigation file is ready — upload your Observation file below and click Run RTKLIB.")
+
+                except RuntimeError as e:
+                    st.error(f"❌ {e}")
+                except Exception as e:
+                    st.error(f"❌ Download failed: {e}")
+
+        st.markdown("---")
+        st.markdown("#### 📂 Upload RINEX files")
+
+        st.warning(
+            "⚠️ **Important — Rename your files before uploading!**\n\n"
+            "Streamlit does not support extensions starting with numbers (`.23o`, `.23n`).\n\n"
+            "Please rename your files like this:\n"
+            "- `01052270.23o` → rename to → `01052270_obs.rnx`\n"
+            "- `01052270.23n` → rename to → `01052270_nav.rnx`\n\n"
+            "The file content stays exactly the same — only the extension changes."
+        )
+
         col_obs, col_nav = st.columns(2)
         with col_obs:
             obs_file = st.file_uploader(
-                "📄 RINEX Observation file (.obs / .rnx / .rnx3)",
-                type=["obs", "rnx", "rnx3", "txt"],
+                "📄 RINEX Observation file (.rnx / .obs / .txt)",
+                type=["rnx", "obs", "rnx3", "txt"],
                 key="rtklib_obs",
             )
         with col_nav:
-            nav_file = st.file_uploader(
-                "📄 RINEX Navigation file (.nav / .rnx / .rnx3)",
-                type=["nav", "rnx", "rnx3", "txt"],
-                key="rtklib_nav",
-            )
+            # Show note if nav was auto-downloaded
+            if st.session_state.get("downloaded_nav_bytes"):
+                st.success(f"✅ Navigation file ready: `{st.session_state.get('downloaded_nav_name')}`  \nNo need to upload — it was downloaded above.")
+                nav_file = None
+            else:
+                nav_file = st.file_uploader(
+                    "📄 RINEX Navigation file (.rnx / .nav / .txt)",
+                    type=["nav", "rnx", "rnx3", "txt"],
+                    key="rtklib_nav",
+                )
 
-        if obs_file and nav_file:
+        # Determine if we have nav from download or upload
+        nav_ready = (
+            nav_file is not None or
+            st.session_state.get("downloaded_nav_bytes") is not None
+        )
+
+        if obs_file and nav_ready:
             if st.button("🚀 Run RTKLIB & Convert to Features", type="primary"):
-                with st.spinner("Running RTKLIB — this may take 10–30 seconds…"):
+                with st.spinner("Running RTKLIB — this may take 10–60 seconds for large files…"):
                     try:
                         if rtklib_path_input.strip():
                             exe = rtklib_path_input.strip()
@@ -662,13 +811,25 @@ def main():
                         st.info(f"✅ Using RTKLIB at: `{exe}`")
 
                         with tempfile.TemporaryDirectory() as tmp:
+                            # Save observation file
                             obs_path = os.path.join(tmp, obs_file.name)
-                            nav_path = os.path.join(tmp, nav_file.name)
                             with open(obs_path, "wb") as f:
                                 f.write(obs_file.read())
-                            with open(nav_path, "wb") as f:
-                                f.write(nav_file.read())
 
+                            # Save navigation file (uploaded or downloaded)
+                            if nav_file is not None:
+                                nav_path = os.path.join(tmp, nav_file.name)
+                                with open(nav_path, "wb") as f:
+                                    f.write(nav_file.read())
+                            else:
+                                nav_name = st.session_state["downloaded_nav_name"]
+                                nav_path = os.path.join(tmp, nav_name)
+                                with open(nav_path, "wb") as f:
+                                    f.write(st.session_state["downloaded_nav_bytes"])
+
+                            st.info(f"📁 Obs: `{os.path.basename(obs_path)}`  |  Nav: `{os.path.basename(nav_path)}`")
+
+                            # Run RTKLIB
                             pos_path = run_rnx2rtkp(obs_path, nav_path, exe, tmp)
                             st.success("✅ RTKLIB processing complete!")
 
@@ -703,12 +864,12 @@ def main():
                     except Exception as e:
                         st.error(f"❌ Unexpected error: {e}")
 
-        elif obs_file and not nav_file:
-            st.warning("⚠️ Please also upload the Navigation (.nav) file.")
-        elif nav_file and not obs_file:
-            st.warning("⚠️ Please also upload the Observation (.obs) file.")
+        elif obs_file and not nav_ready:
+            st.warning("⚠️ Navigation file needed — either download it above or upload it manually.")
+        elif not obs_file and nav_ready:
+            st.warning("⚠️ Please upload your Observation file (.obs / .23O).")
         else:
-            st.info("Upload both RINEX files above, then click **Run RTKLIB**.")
+            st.info("📋 Steps:  1️⃣ Download nav file above (or upload it)  →  2️⃣ Upload your Observation file  →  3️⃣ Click Run RTKLIB")
 
     # ── SECTION 1 — Upload ───────────────────────────────────────────
     st.markdown('<div class="section-header">📂 Section 1 — Upload Data</div>',
