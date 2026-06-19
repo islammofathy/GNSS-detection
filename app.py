@@ -1,21 +1,14 @@
 """
-GNSS Spoofing Detection — Dual Model Comparison App
-=====================================================
-Compares:
-  • best_model  : sklearn SVC (RBF), expects 352 window-stat features
-  • best_dl_model : PyTorch BiLSTM_Attention, expects (batch, seq_len, 88) sequences
+GNSS Spoofing Detection — Six Model Comparison
+===============================================
+ML  : SVM (SVM.pkl) | Random Forest (RandomForest.pkl)
+DL  : Attention-BiLSTM | CNN-LSTM | Transformer | Transformer-Attention
 """
 
-import re
-import io
-import os
-import gzip
-import shutil
-import warnings
-import subprocess
-import tempfile
+import re, io, os, gzip, shutil, warnings, subprocess, tempfile, zipfile
 import requests
 from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -26,158 +19,231 @@ import plotly.graph_objects as go
 import plotly.express as px
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
-    accuracy_score, classification_report,
-    confusion_matrix, roc_auc_score, f1_score,
-    precision_score, recall_score
+    accuracy_score, classification_report, confusion_matrix,
+    roc_auc_score, f1_score, precision_score, recall_score,
 )
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # 0. PAGE CONFIG
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="GNSS Spoofing Detector",
+    page_title="GNSS Spoofing Detector — 6 Models",
     page_icon="🛰️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────
-# 1. CUSTOM CSS — clean, modern look
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. CSS
+# ═══════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-/* ---- Global ---- */
 body { font-family: 'Segoe UI', sans-serif; }
-
-/* ---- Sidebar ---- */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(160deg, #0f2027, #203a43, #2c5364);
+    background: linear-gradient(160deg,#0f2027,#203a43,#2c5364);
 }
-section[data-testid="stSidebar"] * { color: #e0eafc !important; }
-
-/* ---- Metric cards ---- */
+section[data-testid="stSidebar"] * { color:#e0eafc !important; }
 div[data-testid="metric-container"] {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    padding: 14px 18px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.06);
+    background:#f8fafc; border:1px solid #e2e8f0;
+    border-radius:10px; padding:14px 18px;
+    box-shadow:0 1px 4px rgba(0,0,0,.06);
 }
-
-/* ---- Section headers ---- */
 .section-header {
-    background: linear-gradient(90deg, #1a73e8, #0d47a1);
-    color: white !important;
-    padding: 10px 18px;
-    border-radius: 8px;
-    margin-bottom: 12px;
-    font-size: 1.05rem;
-    font-weight: 600;
-    letter-spacing: .3px;
+    background:linear-gradient(90deg,#1a73e8,#0d47a1);
+    color:white !important; padding:10px 18px;
+    border-radius:8px; margin-bottom:12px;
+    font-size:1.05rem; font-weight:600; letter-spacing:.3px;
 }
-
-/* ---- Winner banner ---- */
 .winner-banner {
-    background: linear-gradient(135deg, #11998e, #38ef7d);
-    color: white;
-    padding: 18px 24px;
-    border-radius: 12px;
-    font-size: 1.25rem;
-    font-weight: 700;
-    text-align: center;
-    margin-top: 10px;
+    background:linear-gradient(135deg,#11998e,#38ef7d);
+    color:white; padding:18px 24px; border-radius:12px;
+    font-size:1.25rem; font-weight:700; text-align:center; margin-top:10px;
 }
-
-/* ---- Spoofing alert ---- */
-.alert-spoof  { color: #e53e3e; font-weight: 700; }
-.alert-clean  { color: #38a169; font-weight: 700; }
-
-/* ---- Tabs ---- */
-button[data-baseweb="tab"] { font-size: .95rem; font-weight: 600; }
+.alert-spoof { color:#e53e3e; font-weight:700; }
+.alert-clean { color:#38a169; font-weight:700; }
+button[data-baseweb="tab"] { font-size:.95rem; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+WINDOW        = 30
+ML_N_FEATURES = 256
+DL_INPUT_DIM  = 55
 
-# ─────────────────────────────────────────────
-# 2. NEURAL NETWORK DEFINITION
-#    (must match exactly how it was trained)
-# ─────────────────────────────────────────────
-class BiLSTM_Attention(nn.Module):
-    """Bidirectional LSTM with soft attention — the saved deep model."""
+MODEL_COLORS = {
+    "SVM":                   "#1a73e8",
+    "Random Forest":         "#0d47a1",
+    "Attention-BiLSTM":      "#e84e1a",
+    "CNN-LSTM":              "#e8a21a",
+    "Transformer":           "#9c27b0",
+    "Transformer-Attention": "#009688",
+}
+ML_MODELS  = ["SVM", "Random Forest"]
+DL_MODELS  = ["Attention-BiLSTM", "CNN-LSTM", "Transformer", "Transformer-Attention"]
+ALL_MODELS = ML_MODELS + DL_MODELS
 
-    def __init__(self, input_dim: int, hidden_dim: int = 64):
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. DEEP LEARNING ARCHITECTURES
+# ═══════════════════════════════════════════════════════════════════════════
+class AttentionBiLSTM(nn.Module):
+    def __init__(self, input_dim=DL_INPUT_DIM, hidden_dim=64, num_layers=2,
+                 dropout=0.3, num_classes=2):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim,
-                            batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
+                            batch_first=True, bidirectional=True,
+                            dropout=dropout if num_layers > 1 else 0)
         self.attn = nn.Linear(hidden_dim * 2, 1)
-        self.fc   = nn.Linear(hidden_dim * 2, 2)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
-        out, _ = self.lstm(x)                          # (B, T, 2H)
-        weights = torch.softmax(self.attn(out), dim=1) # (B, T, 1)
-        context = (out * weights).sum(dim=1)           # (B, 2H)
-        return self.fc(context)
+        out, _ = self.lstm(x)
+        w = torch.softmax(self.attn(out), dim=1)
+        ctx = (out * w).sum(dim=1)
+        return self.fc(self.dropout(ctx))
 
 
-# ─────────────────────────────────────────────
-# 3. CONSTANTS (match training script)
-# ─────────────────────────────────────────────
-WINDOW        = 30    # sliding window size used during training
-ML_N_FEATURES = 352  # SVC expects 4 * 88 stat-features per window
-DL_INPUT_DIM  = 88   # BiLSTM input size per time-step
+class CNNLSTMModel(nn.Module):
+    def __init__(self, input_dim=DL_INPUT_DIM, num_filters=64,
+                 kernel_size=3, hidden_dim=64, num_layers=2,
+                 dropout=0.3, num_classes=2):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_dim, num_filters, kernel_size, padding=1)
+        self.conv2 = nn.Conv1d(num_filters, num_filters * 2, kernel_size, padding=1)
+        self.bn1   = nn.BatchNorm1d(num_filters)
+        self.bn2   = nn.BatchNorm1d(num_filters * 2)
+        self.pool  = nn.MaxPool1d(2)
+        self.relu  = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.lstm  = nn.LSTM(num_filters * 2, hidden_dim, num_layers=num_layers,
+                             batch_first=True, bidirectional=True,
+                             dropout=dropout if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.dropout(x)
+        x = x.permute(0, 2, 1)
+        out, _ = self.lstm(x)
+        return self.fc(self.dropout(out[:, -1, :]))
 
 
-# ─────────────────────────────────────────────
-# 4. MODEL LOADING (cached — runs once)
-# ─────────────────────────────────────────────
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim=DL_INPUT_DIM, d_model=128, nhead=8,
+                 num_layers=3, dim_feedforward=256, dropout=0.1, num_classes=2):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_enc    = nn.Parameter(torch.zeros(1, WINDOW, d_model))
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        x = self.transformer(self.dropout(x))
+        return self.fc(x.mean(dim=1))
+
+
+class TransformerAttentionModel(nn.Module):
+    def __init__(self, input_dim=DL_INPUT_DIM, d_model=128, nhead=8,
+                 num_layers=3, dim_feedforward=256, dropout=0.1, num_classes=2):
+        super().__init__()
+        self.input_proj  = nn.Linear(input_dim, d_model)
+        self.pos_enc     = nn.Parameter(torch.zeros(1, WINDOW, d_model))
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.attn_pool   = nn.Linear(d_model, 1)
+        self.dropout     = nn.Dropout(dropout)
+        self.fc          = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        x = self.transformer(self.dropout(x))
+        w = torch.softmax(self.attn_pool(x), dim=1)
+        ctx = (x * w).sum(dim=1)
+        return self.fc(ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. MODEL LOADING
+# ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner=False)
-def load_models():
-    """Load both pickled models from the repo root."""
-    # ── sklearn SVC ──────────────────────────────────────────────────
-    svc = joblib.load("best_model.pkl")
-
-    # ── PyTorch BiLSTM ───────────────────────────────────────────────
+def load_all_models():
     device = torch.device("cpu")
-    dl_model = torch.load(
-        "best_dl_model.pkl",
-        map_location=device,
-        weights_only=False,
-    )
-    dl_model.eval()
+    models = {}
+    errors = {}
 
-    return svc, dl_model, device
+    # ── ML models ────────────────────────────────────────────────────
+    for name, path in [("SVM", "SVM.pkl"), ("Random Forest", "RandomForest.pkl")]:
+        try:
+            models[name] = joblib.load(path)
+        except Exception as e:
+            errors[name] = str(e)
+
+    # ── DL models ────────────────────────────────────────────────────
+    dl_specs = [
+        ("Attention-BiLSTM",      "best_attention_bilstm.pth",      AttentionBiLSTM),
+        ("CNN-LSTM",              "best_cnn_lstm.pth",               CNNLSTMModel),
+        ("Transformer",           "best_transformer.pth",            TransformerModel),
+        ("Transformer-Attention", "best_transformer_attention.pth",  TransformerAttentionModel),
+    ]
+    for name, path, cls in dl_specs:
+        try:
+            state = torch.load(path, map_location=device, weights_only=True)
+            # Handle both raw state_dict and wrapped checkpoint
+            if isinstance(state, dict) and "model_state_dict" in state:
+                state = state["model_state_dict"]
+            m = cls()
+            if isinstance(state, dict):
+                m.load_state_dict(state, strict=False)
+            else:
+                m = state  # full model saved
+            m.eval()
+            models[name] = m
+        except Exception as e:
+            # Fallback: try loading as full model
+            try:
+                m = torch.load(path, map_location=device, weights_only=False)
+                if hasattr(m, "eval"):
+                    m.eval()
+                    models[name] = m
+                else:
+                    errors[name] = "Not a valid PyTorch model"
+            except Exception as e2:
+                errors[name] = str(e2)
+
+    return models, errors, device
 
 
-# ─────────────────────────────────────────────
-# 5. PREPROCESSING HELPERS
-# ─────────────────────────────────────────────
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip duplicate numeric suffixes from column names (e.g. 'col.1' → 'col')."""
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. PREPROCESSING
+# ═══════════════════════════════════════════════════════════════════════════
+def clean_columns(df):
     df = df.copy()
     df.columns = [re.sub(r'\.\d+$', '', c) for c in df.columns]
     return df
 
-
-def remove_duplicate_cols(df: pd.DataFrame) -> pd.DataFrame:
+def remove_duplicate_cols(df):
     return df.loc[:, ~df.columns.duplicated()]
 
+def npy_to_dataframe(arr):
+    if arr.ndim == 1: arr = arr.reshape(-1, 1)
+    return pd.DataFrame(arr, columns=[f"feature_{i}" for i in range(arr.shape[1])])
 
-def npy_to_dataframe(data: np.ndarray) -> pd.DataFrame:
-    """Convert a numpy array to a DataFrame with generic column names."""
-    if data.ndim == 1:
-        data = data.reshape(-1, 1)
-    cols = [f"feature_{i}" for i in range(data.shape[1])]
-    return pd.DataFrame(data, columns=cols)
-
-
-def rinex_to_dataframe(text: str) -> pd.DataFrame:
-    """
-    Minimal RINEX obs-file parser.
-    Extracts numeric observation values line-by-line and returns a DataFrame.
-    This is a best-effort parser for demo purposes.
-    """
+def rinex_to_dataframe(text):
     rows = []
     for line in text.splitlines():
         nums = re.findall(r'[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?', line)
@@ -187,45 +253,10 @@ def rinex_to_dataframe(text: str) -> pd.DataFrame:
         raise ValueError("No numeric data extracted from RINEX file.")
     max_len = max(len(r) for r in rows)
     padded  = [r + [np.nan] * (max_len - len(r)) for r in rows]
-    cols    = [f"obs_{i}" for i in range(max_len)]
-    return pd.DataFrame(padded, columns=cols).dropna(axis=1, thresh=len(padded) // 2)
+    df = pd.DataFrame(padded, columns=[f"obs_{i}" for i in range(max_len)])
+    return df.dropna(axis=1, thresh=len(padded) // 2)
 
-
-def build_window_features(df_feat: pd.DataFrame, window: int = WINDOW) -> np.ndarray:
-    """
-    Reproduce the training feature engineering:
-      For each non-overlapping window of `window` rows compute
-      [mean, std, var, diff] → concatenate → one row per window.
-    Returns shape (n_windows, 4 * n_features).
-    """
-    X = df_feat.values.astype(np.float32)
-    rows = []
-    for i in range(0, len(X) - window, window):
-        w   = X[i : i + window]
-        mean = np.mean(w, axis=0)
-        std  = np.std(w,  axis=0)
-        var  = np.var(w,  axis=0)
-        diff = w[-1] - w[0]
-        rows.append(np.concatenate([mean, std, var, diff]))
-    return np.array(rows, dtype=np.float32)
-
-
-def build_sequences(df_feat: pd.DataFrame, window: int = WINDOW) -> np.ndarray:
-    """
-    Build 3-D sequences for the BiLSTM:  (n_windows, window, n_features).
-    """
-    X = df_feat.values.astype(np.float32)
-    seqs = []
-    for i in range(0, len(X) - window, window):
-        seqs.append(X[i : i + window])
-    return np.array(seqs, dtype=np.float32)   # (N, T, F)
-
-
-def align_features(df: pd.DataFrame, target_n: int) -> pd.DataFrame:
-    """
-    Pad or truncate the DataFrame to exactly `target_n` feature columns
-    so the models always receive the correct input width.
-    """
+def align_features(df, target_n):
     n = df.shape[1]
     if n < target_n:
         for i in range(target_n - n):
@@ -234,536 +265,305 @@ def align_features(df: pd.DataFrame, target_n: int) -> pd.DataFrame:
         df = df.iloc[:, :target_n]
     return df
 
+def build_ml_features(df_feat, window=WINDOW):
+    """Build (n_windows, 4*n_cols) stat features for ML models."""
+    X = df_feat.values.astype(np.float32)
+    rows = []
+    for i in range(0, len(X) - window, window):
+        w = X[i:i+window]
+        rows.append(np.concatenate([
+            np.mean(w, 0), np.std(w, 0), np.var(w, 0), w[-1]-w[0]
+        ]))
+    return np.array(rows, dtype=np.float32)
 
-# ─────────────────────────────────────────────
-# 6. PREDICTION HELPERS
-# ─────────────────────────────────────────────
-def predict_svc(svc, X_win: np.ndarray):
-    """Run the sklearn SVC on window-stat features."""
-    preds = svc.predict(X_win)
-    if hasattr(svc, "predict_proba"):
-        proba = svc.predict_proba(X_win)[:, 1]
-    elif hasattr(svc, "decision_function"):
-        raw   = svc.decision_function(X_win)
-        proba = 1 / (1 + np.exp(-raw))   # sigmoid squash
+def build_sequences(df_feat, window=WINDOW):
+    """Build (n_windows, window, n_cols) sequences for DL models."""
+    X = df_feat.values.astype(np.float32)
+    seqs = [X[i:i+window] for i in range(0, len(X) - window, window)]
+    return np.array(seqs, dtype=np.float32)
+
+def pad_or_trim(arr, target):
+    """Ensure 2-D array has exactly `target` columns."""
+    n = arr.shape[1]
+    if n < target:
+        return np.hstack([arr, np.zeros((arr.shape[0], target - n), dtype=np.float32)])
+    return arr[:, :target]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. INFERENCE
+# ═══════════════════════════════════════════════════════════════════════════
+def predict_ml(model, X):
+    preds = model.predict(X)
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)[:, 1]
+    elif hasattr(model, "decision_function"):
+        raw   = model.decision_function(X)
+        proba = 1 / (1 + np.exp(-raw))
     else:
         proba = preds.astype(float)
-    return preds, proba
+    return preds.astype(int), proba.astype(float)
 
-
-def predict_bilstm(dl_model, X_seq: np.ndarray, device):
-    """Run the BiLSTM-Attention model on sequences."""
-    dl_model.eval()
-    tensor = torch.tensor(X_seq, dtype=torch.float32).to(device)
+def predict_dl(model, X, device):
+    model.eval()
+    t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
-        logits = dl_model(tensor)          # (N, 2)
+        logits = model(t)
         probs  = torch.softmax(logits, 1)
         preds  = torch.argmax(probs, 1).cpu().numpy()
         proba  = probs[:, 1].cpu().numpy()
-    return preds, proba
+    return preds.astype(int), proba.astype(float)
 
 
-# ─────────────────────────────────────────────
-# 7. METRIC HELPERS
-# ─────────────────────────────────────────────
-def compute_metrics(y_true, y_pred, y_proba, name: str) -> dict:
-    acc  = accuracy_score(y_true, y_pred)
-    f1   = f1_score(y_true, y_pred, average="binary", zero_division=0)
-    prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
-    rec  = recall_score(y_true, y_pred, average="binary", zero_division=0)
-    try:
-        auc = roc_auc_score(y_true, y_proba)
-    except Exception:
-        auc = float("nan")
-    return dict(model=name, accuracy=acc, f1=f1,
-                precision=prec, recall=rec, auc_roc=auc)
-
-
-# ─────────────────────────────────────────────
-# 8. CHART HELPERS
-# ─────────────────────────────────────────────
-def confusion_heatmap(y_true, y_pred, title: str):
-    cm     = confusion_matrix(y_true, y_pred)
-    labels = ["Clean (0)", "Spoofed (1)"]
-    fig    = px.imshow(
-        cm, text_auto=True,
-        x=labels, y=labels,
-        color_continuous_scale="Blues",
-        title=title,
-        labels=dict(x="Predicted", y="Actual"),
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. METRICS & CHARTS
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_metrics(y_true, y_pred, y_proba, name):
+    try:   auc = roc_auc_score(y_true, y_proba)
+    except: auc = float("nan")
+    return dict(
+        model=name,
+        accuracy =accuracy_score(y_true, y_pred),
+        f1       =f1_score(y_true, y_pred, average="binary", zero_division=0),
+        precision=precision_score(y_true, y_pred, average="binary", zero_division=0),
+        recall   =recall_score(y_true, y_pred, average="binary", zero_division=0),
+        auc_roc  =auc,
     )
-    fig.update_layout(margin=dict(t=50, b=20), height=320)
+
+def confusion_heatmap(y_true, y_pred, title):
+    cm  = confusion_matrix(y_true, y_pred)
+    lbl = ["Clean", "Spoofed"]
+    fig = px.imshow(cm, text_auto=True, x=lbl, y=lbl,
+                    color_continuous_scale="Blues", title=title,
+                    labels=dict(x="Predicted", y="Actual"))
+    fig.update_layout(margin=dict(t=50,b=10), height=300)
     return fig
 
-
-def metric_radar(metrics_list: list[dict]):
-    dims   = ["accuracy", "f1", "precision", "recall", "auc_roc"]
-    labels = [d.replace("_", " ").title() for d in dims]
-    colors = ["#1a73e8", "#e84e1a"]
+def metric_radar(metrics_list):
+    dims   = ["accuracy","f1","precision","recall","auc_roc"]
+    labels = [d.replace("_"," ").title() for d in dims]
+    colors = list(MODEL_COLORS.values())
     fig    = go.Figure()
     for i, m in enumerate(metrics_list):
         vals = [m[d] for d in dims]
         fig.add_trace(go.Scatterpolar(
-            r=vals + [vals[0]],
-            theta=labels + [labels[0]],
-            fill="toself",
-            name=m["model"],
+            r=vals+[vals[0]], theta=labels+[labels[0]],
+            fill="toself", name=m["model"],
             line_color=colors[i % len(colors)],
         ))
     fig.update_layout(
-        polar=dict(radialaxis=dict(range=[0, 1], visible=True)),
-        legend=dict(orientation="h"),
-        title="Model Performance Radar",
-        height=360,
-        margin=dict(t=50, b=10),
+        polar=dict(radialaxis=dict(range=[0,1])),
+        legend=dict(orientation="h"), title="Performance Radar",
+        height=400, margin=dict(t=50,b=10),
     )
     return fig
 
-
-def proba_histogram(proba_svc, proba_dl):
+def proba_timeline_fig(results):
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=proba_svc, name="SVC",
-                               opacity=.65, nbinsx=30,
-                               marker_color="#1a73e8"))
-    fig.add_trace(go.Histogram(x=proba_dl,  name="BiLSTM",
-                               opacity=.65, nbinsx=30,
-                               marker_color="#e84e1a"))
-    fig.update_layout(barmode="overlay",
-                      title="Predicted Spoofing Probability Distribution",
-                      xaxis_title="P(Spoofed)",
-                      yaxis_title="Windows",
-                      height=300,
-                      margin=dict(t=50, b=20))
+    for name, res in results.items():
+        fig.add_trace(go.Scatter(
+            y=res["proba"], name=name, mode="lines",
+            line=dict(color=MODEL_COLORS.get(name,"#888")),
+        ))
+    fig.update_layout(
+        title="Spoofing Probability per Window",
+        xaxis_title="Window", yaxis_title="P(Spoofed)",
+        height=320, margin=dict(t=50,b=20), legend=dict(orientation="h"),
+    )
     return fig
 
-
-def pred_timeline(preds_svc, preds_dl):
-    n   = min(len(preds_svc), len(preds_dl))
+def pred_timeline_fig(results):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=preds_svc[:n], name="SVC",
-                             mode="lines+markers",
-                             line=dict(color="#1a73e8")))
-    fig.add_trace(go.Scatter(y=preds_dl[:n],  name="BiLSTM",
-                             mode="lines+markers",
-                             line=dict(color="#e84e1a", dash="dash")))
+    for name, res in results.items():
+        fig.add_trace(go.Scatter(
+            y=res["preds"], name=name, mode="lines+markers",
+            line=dict(color=MODEL_COLORS.get(name,"#888")),
+        ))
     fig.update_layout(
         title="Predictions per Window (0=Clean, 1=Spoofed)",
-        xaxis_title="Window index",
-        yaxis=dict(tickvals=[0, 1], ticktext=["Clean", "Spoofed"]),
-        height=300,
-        margin=dict(t=50, b=20),
-        legend=dict(orientation="h"),
+        xaxis_title="Window",
+        yaxis=dict(tickvals=[0,1], ticktext=["Clean","Spoofed"]),
+        height=300, margin=dict(t=50,b=20), legend=dict(orientation="h"),
+    )
+    return fig
+
+def proba_hist_fig(results):
+    fig = go.Figure()
+    for name, res in results.items():
+        fig.add_trace(go.Histogram(
+            x=res["proba"], name=name, opacity=0.6, nbinsx=30,
+            marker_color=MODEL_COLORS.get(name,"#888"),
+        ))
+    fig.update_layout(
+        barmode="overlay",
+        title="Spoofing Probability Distribution",
+        xaxis_title="P(Spoofed)", yaxis_title="Windows",
+        height=300, margin=dict(t=50,b=20), legend=dict(orientation="h"),
     )
     return fig
 
 
-# ─────────────────────────────────────────────
-# RTKLIB AUTO-INSTALLER (Streamlit Cloud / Linux)
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. RTKLIB AUTO-INSTALLER
+# ═══════════════════════════════════════════════════════════════════════════
+RTKLIB_DIR = os.path.expanduser("~/.rtklib")
+RTKLIB_EXE = os.path.join(RTKLIB_DIR, "rnx2rtkp")
 
-RTKLIB_INSTALL_DIR = os.path.expanduser("~/.rtklib")
-RTKLIB_EXE         = os.path.join(RTKLIB_INSTALL_DIR, "rnx2rtkp")
-
-def is_rtklib_installed() -> bool:
+def is_rtklib_installed():
     return os.path.isfile(RTKLIB_EXE) and os.access(RTKLIB_EXE, os.X_OK)
 
-def install_rtklib_linux(status_placeholder) -> bool:
-    """
-    Install rnx2rtkp on Linux (Streamlit Cloud).
-    Strategy 1: apt-get install rtklib (fastest, no compile needed)
-    Strategy 2: Download prebuilt binary from GitHub releases
-    Strategy 3: Compile from source using requests (not wget)
-    """
-    os.makedirs(RTKLIB_INSTALL_DIR, exist_ok=True)
-
-    # ── Strategy 1: apt-get ───────────────────────────────────────────
-    status_placeholder.info("📦 Trying to install RTKLIB via apt-get…")
+def install_rtklib_linux(ph):
+    os.makedirs(RTKLIB_DIR, exist_ok=True)
+    # Strategy 1: apt-get
+    ph.info("📦 Trying apt-get install rtklib…")
     try:
-        r = subprocess.run(
-            ["apt-get", "install", "-y", "-q", "rtklib"],
-            capture_output=True, text=True, timeout=120
-        )
-        apt_path = shutil.which("rnx2rtkp")
-        if apt_path:
-            shutil.copy(apt_path, RTKLIB_EXE)
-            os.chmod(RTKLIB_EXE, 0o755)
-            status_placeholder.success("✅ RTKLIB installed via apt-get!")
-            return True
-    except Exception:
-        pass
-
-    # ── Strategy 2: Download prebuilt binary via requests ─────────────
-    status_placeholder.info("📥 Downloading RTKLIB source via Python requests…")
+        subprocess.run(["apt-get","install","-y","-q","rtklib"],
+                       capture_output=True, timeout=120)
+        apt = shutil.which("rnx2rtkp")
+        if apt:
+            shutil.copy(apt, RTKLIB_EXE); os.chmod(RTKLIB_EXE, 0o755)
+            ph.success("✅ RTKLIB installed via apt-get!"); return True
+    except Exception: pass
+    # Strategy 2: requests + compile
+    ph.info("📥 Downloading RTKLIB source…")
     try:
-        import zipfile
-        zip_url = "https://github.com/tomojitakasu/RTKLIB/archive/refs/tags/v2.4.3b34.zip"
-        zip_path = "/tmp/rtklib.zip"
-
-        resp = requests.get(zip_url, timeout=120, stream=True)
-        if resp.status_code == 200:
-            with open(zip_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    f.write(chunk)
-            status_placeholder.info("📦 Extracting RTKLIB source…")
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall("/tmp/")
-
-            status_placeholder.info("🔨 Compiling rnx2rtkp (this takes ~2 minutes)…")
-            make_result = subprocess.run(
-                ["make", "-C", "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc", "-j2"],
-                capture_output=True, text=True, timeout=300
-            )
-            compiled = "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc/rnx2rtkp"
-            if os.path.isfile(compiled):
-                shutil.copy(compiled, RTKLIB_EXE)
-                os.chmod(RTKLIB_EXE, 0o755)
-                status_placeholder.success("✅ RTKLIB compiled and installed!")
-                return True
-            else:
-                status_placeholder.warning(f"⚠️ Compile output:\n{make_result.stderr[:300]}")
-    except Exception as e:
-        status_placeholder.warning(f"⚠️ Source compile failed: {e}")
-
-    # ── Strategy 3: git clone ─────────────────────────────────────────
-    status_placeholder.info("📥 Trying git clone as fallback…")
-    try:
-        subprocess.run(
-            ["git", "clone", "--depth=1", "--branch", "v2.4.3b34",
-             "https://github.com/tomojitakasu/RTKLIB.git", "/tmp/RTKLIB_git"],
-            capture_output=True, text=True, timeout=180
-        )
-        make_result = subprocess.run(
-            ["make", "-C", "/tmp/RTKLIB_git/app/rnx2rtkp/gcc", "-j2"],
-            capture_output=True, text=True, timeout=300
-        )
-        compiled = "/tmp/RTKLIB_git/app/rnx2rtkp/gcc/rnx2rtkp"
-        if os.path.isfile(compiled):
-            shutil.copy(compiled, RTKLIB_EXE)
-            os.chmod(RTKLIB_EXE, 0o755)
-            status_placeholder.success("✅ RTKLIB installed via git clone!")
-            return True
-    except Exception as e:
-        status_placeholder.warning(f"⚠️ Git clone failed: {e}")
-
-    status_placeholder.error(
-        "❌ All installation methods failed.\n\n"
-        "This is likely a Streamlit Cloud network restriction.\n"
-        "Please add `rtklib` to your `packages.txt` file in your GitHub repo."
-    )
+        r = requests.get("https://github.com/tomojitakasu/RTKLIB/archive/refs/tags/v2.4.3b34.zip",
+                         timeout=120, stream=True)
+        if r.status_code == 200:
+            zp = "/tmp/rtklib.zip"
+            with open(zp,"wb") as f:
+                for chunk in r.iter_content(65536): f.write(chunk)
+            with zipfile.ZipFile(zp) as z: z.extractall("/tmp/")
+            ph.info("🔨 Compiling rnx2rtkp…")
+            subprocess.run(["make","-C","/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc","-j2"],
+                           capture_output=True, timeout=300)
+            src = "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc/rnx2rtkp"
+            if os.path.isfile(src):
+                shutil.copy(src, RTKLIB_EXE); os.chmod(RTKLIB_EXE, 0o755)
+                ph.success("✅ RTKLIB compiled!"); return True
+    except Exception as e: ph.warning(f"Compile failed: {e}")
+    ph.error("❌ RTKLIB installation failed. Add `rtklib` to packages.txt.")
     return False
 
+def get_rtklib_exe(ph=None):
+    if os.name == "nt": return _find_rtklib_windows()
+    if is_rtklib_installed(): return RTKLIB_EXE
+    if ph and install_rtklib_linux(ph): return RTKLIB_EXE
+    raise RuntimeError("RTKLIB not available.")
 
-def get_rtklib_exe(status_placeholder=None) -> str:
-    """
-    Returns path to rnx2rtkp:
-    - On Linux (Streamlit Cloud): auto-installs if needed
-    - On Windows: uses find_rnx2rtkp() (PATH or common locations)
-    """
-    if os.name == "nt":  # Windows
-        return find_rnx2rtkp()
-    else:  # Linux / Streamlit Cloud
-        if is_rtklib_installed():
-            return RTKLIB_EXE
-        if status_placeholder:
-            success = install_rtklib_linux(status_placeholder)
-            if success:
-                return RTKLIB_EXE
-        raise RuntimeError("RTKLIB could not be installed on the server.")
-
-
-# ─────────────────────────────────────────────
-# 9. NAVIGATION FILE AUTO-DOWNLOADER
-# ─────────────────────────────────────────────
-
-def date_to_doy(year: int, month: int, day: int):
-    """Convert calendar date to day-of-year."""
-    return datetime(year, month, day).timetuple().tm_yday
-
-
-def build_nav_urls(year: int, month: int, day: int) -> list:
-    """
-    Build a list of candidate URLs for the IGS broadcast navigation file
-    (BRDC) for the given date. Tries multiple mirrors in order.
-    """
-    doy   = date_to_doy(year, month, day)
-    yr2   = str(year)[2:]   # e.g. "23"
-    yr4   = year            # e.g. 2023
-
-    # Legacy RINEX 2 nav filename  e.g. brdc2780.23n.gz
-    legacy_name = f"brdc{doy:03d}0.{yr2}n"
-
-    # RINEX 3 mixed nav filename
-    rinex3_name = f"BRDC00IGS_R_{yr4}{doy:03d}0000_01D_MN.rnx"
-
-    mirrors = [
-        # ── CDDIS NASA (most reliable, needs Earthdata but often open) ──
-        f"https://cddis.nasa.gov/archive/gnss/data/daily/{yr4}/{doy:03d}/{yr2}n/{legacy_name}.gz",
-        f"https://cddis.nasa.gov/archive/gnss/data/daily/{yr4}/brdc/{legacy_name}.gz",
-        # ── BKG Germany ──
-        f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{yr4}/{doy:03d}/{rinex3_name}.gz",
-        # ── IGN France ──
-        f"https://igs.ign.fr/pub/igs/data/daily/{yr4}/{doy:03d}/{legacy_name}.gz",
-        f"https://igs.ign.fr/pub/igs/data/daily/{yr4}/{doy:03d}/{legacy_name}.Z",
-        # ── GFZ Germany ──
-        f"https://ftp.gfz-potsdam.de/pub/GNSS/data/daily/{yr4}/{doy:03d}/{legacy_name}.gz",
-        # ── EUREF ──
-        f"https://igs.bkg.bund.de/root_ftp/EUREF/BRDC/{yr4}/{doy:03d}/{rinex3_name}.gz",
-    ]
-    return mirrors, legacy_name
-
-
-def download_nav_file(year: int, month: int, day: int, save_dir: str) -> str:
-    """
-    Try each mirror in order until one succeeds.
-    Decompresses .gz automatically.
-    Returns the path to the decompressed nav file, or raises RuntimeError.
-    """
-    mirrors, legacy_name = build_nav_urls(year, month, day)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RTKLIB/2.4.3",
-        "Accept": "*/*",
-    }
-
-    for url in mirrors:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30, stream=True)
-            if resp.status_code == 200:
-                # Save compressed file
-                gz_path  = os.path.join(save_dir, legacy_name + ".gz")
-                nav_path = os.path.join(save_dir, legacy_name)
-
-                with open(gz_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-
-                # Decompress
-                with gzip.open(gz_path, "rb") as f_in, open(nav_path, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-
-                os.remove(gz_path)
-                return nav_path
-        except Exception:
-            continue
-
-    raise RuntimeError(
-        "Could not download navigation file from any IGS mirror.\n"
-        "Please download it manually from:\n"
-        "https://cddis.nasa.gov/Data_and_Derived_Products/GNSS/broadcast_ephemeris_data.html\n"
-        "Or ask your supervisor for the .23N file."
-    )
-
-
-# ─────────────────────────────────────────────
-# 10. RTKLIB HELPERS
-# ─────────────────────────────────────────────
-
-RTKLIB_CHANNELS = 8   # ch0 → ch7, matching your training data
-SAMPLING_FREQ   = 4000000  # default 4 MHz — adjust if needed
-
-def find_rnx2rtkp() -> str:
-    """
-    Find rnx2rtkp.exe — checks PATH first, then common Windows install locations.
-    Returns the full path or raises FileNotFoundError.
-    """
-    # 1. Check if it's already on PATH
-    import shutil
+def _find_rtklib_windows():
     found = shutil.which("rnx2rtkp") or shutil.which("rnx2rtkp.exe")
-    if found:
-        return found
+    if found: return found
+    for p in [r"C:\RTKLIB\bin\rnx2rtkp.exe",
+               r"C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe"]:
+        if os.path.isfile(p): return p
+    raise FileNotFoundError("rnx2rtkp.exe not found. Enter full path below.")
 
-    # 2. Check common Windows locations the user might have extracted to
-    common_paths = [
-        r"C:\RTKLIB\bin\rnx2rtkp.exe",
-        r"C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
-        r"C:\rtklib\bin\rnx2rtkp.exe",
-        r"C:\Program Files\RTKLIB\bin\rnx2rtkp.exe",
-        r"C:\Users\Public\RTKLIB\bin\rnx2rtkp.exe",
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. NAVIGATION FILE DOWNLOADER
+# ═══════════════════════════════════════════════════════════════════════════
+def download_nav_file(year, month, day, save_dir):
+    doy  = datetime(year, month, day).timetuple().tm_yday
+    yr2  = str(year)[2:]
+    name = f"brdc{doy:03d}0.{yr2}n"
+    urls = [
+        f"https://cddis.nasa.gov/archive/gnss/data/daily/{year}/{doy:03d}/{yr2}n/{name}.gz",
+        f"https://cddis.nasa.gov/archive/gnss/data/daily/{year}/brdc/{name}.gz",
+        f"https://igs.ign.fr/pub/igs/data/daily/{year}/{doy:03d}/{name}.gz",
+        f"https://ftp.gfz-potsdam.de/pub/GNSS/data/daily/{year}/{doy:03d}/{name}.gz",
     ]
-    for p in common_paths:
-        if os.path.isfile(p):
-            return p
-
-    raise FileNotFoundError(
-        "rnx2rtkp.exe not found. "
-        "Please add your RTKLIB bin folder to Windows PATH "
-        "or enter the full path below."
-    )
-
-
-def write_rtklib_conf(conf_path: str):
-    """Write a minimal RTKLIB config file optimised for feature extraction."""
-    conf_content = """\
-pos1-posmode     =single
-pos1-elmask      =15
-pos1-snrmask_ena =off
-pos1-snrmask_r   =0,0,0,0,0,0,0,0,0
-pos1-dynamics    =off
-pos1-tidecorr    =off
-pos1-ionoopt     =brdc
-pos1-tropopt     =saas
-pos1-sateph      =brdc
-pos1-exclsats    =
-pos1-navsys      =1
-out-solformat    =llh
-out-outstat      =residual
-out-timesys      =gpst
-out-timeform     =tow
-out-timendec     =3
-out-degform      =deg
-out-fieldsep     =
-out-height       =ellipsoidal
-out-geoid        =internal
-out-solstatic    =all
-out-nmeaintv1    =0
-out-nmeaintv2    =0
-out-outhead      =on
-out-outopt       =on
-out-outvel       =off
-"""
-    with open(conf_path, "w") as f:
-        f.write(conf_content)
+    hdrs = {"User-Agent": "Mozilla/5.0 RTKLIB/2.4.3", "Accept": "*/*"}
+    for url in urls:
+        try:
+            r = requests.get(url, headers=hdrs, timeout=30, stream=True)
+            if r.status_code == 200:
+                gz = os.path.join(save_dir, name+".gz")
+                nav = os.path.join(save_dir, name)
+                with open(gz,"wb") as f:
+                    for chunk in r.iter_content(8192): f.write(chunk)
+                with gzip.open(gz,"rb") as fi, open(nav,"wb") as fo:
+                    shutil.copyfileobj(fi, fo)
+                os.remove(gz)
+                return nav
+        except Exception: continue
+    raise RuntimeError("Could not download nav file from any IGS mirror.")
 
 
-def run_rnx2rtkp(obs_path: str, nav_path: str, rtklib_exe: str, work_dir: str) -> str:
-    """
-    Run rnx2rtkp and return the path to the output .pos file.
-    Raises RuntimeError if RTKLIB fails.
-    """
-    conf_path = os.path.join(work_dir, "rtklib.conf")
-    out_path  = os.path.join(work_dir, "output.pos")
-    write_rtklib_conf(conf_path)
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. RTKLIB PROCESSING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+RTKLIB_CHANNELS = 8
+SAMPLING_FREQ   = 4_000_000
 
-    cmd = [rtklib_exe, "-k", conf_path, "-o", out_path, obs_path, nav_path]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+def write_rtklib_conf(path):
+    with open(path,"w") as f:
+        f.write("pos1-posmode=single\npos1-elmask=15\npos1-ionoopt=brdc\n"
+                "pos1-tropopt=saas\npos1-sateph=brdc\nout-solformat=llh\n"
+                "out-outstat=residual\nout-outhead=on\nout-outopt=on\n")
 
-    # rnx2rtkp writes results to stderr as well as stdout — check both
-    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
-        raise RuntimeError(
-            f"RTKLIB produced no output.\n"
-            f"STDOUT: {result.stdout[:500]}\n"
-            f"STDERR: {result.stderr[:500]}"
-        )
-    return out_path
+def run_rnx2rtkp(obs, nav, exe, work):
+    conf = os.path.join(work,"rtklib.conf")
+    out  = os.path.join(work,"output.pos")
+    write_rtklib_conf(conf)
+    subprocess.run([exe,"-k",conf,"-o",out,obs,nav],
+                   capture_output=True, text=True, timeout=300)
+    if not os.path.isfile(out) or os.path.getsize(out)==0:
+        raise RuntimeError("RTKLIB produced no output.")
+    return out
 
-
-def parse_pos_file(pos_path: str) -> pd.DataFrame:
-    """
-    Parse RTKLIB .pos solution file.
-    Columns returned: date, time, lat, lon, height, fix_status, num_sats, pdop, sdx, sdy, sdz
-    """
-    rows = []
-    with open(pos_path, "r") as f:
+def parse_pos_file(path):
+    rows=[]
+    with open(path) as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("%"):
-                continue
-            parts = line.split()
-            if len(parts) < 8:
-                continue
+            line=line.strip()
+            if not line or line.startswith("%"): continue
+            p=line.split()
+            if len(p)<8: continue
             try:
-                row = {
-                    "date":       parts[0],
-                    "time":       parts[1],
-                    "lat":        float(parts[2]),
-                    "lon":        float(parts[3]),
-                    "height":     float(parts[4]),
-                    "fix_status": int(parts[5]),
-                    "num_sats":   int(parts[6]),
-                    "pdop":       float(parts[7]),
-                    "sdx":        float(parts[8])  if len(parts) > 8  else 0.0,
-                    "sdy":        float(parts[9])  if len(parts) > 9  else 0.0,
-                    "sdz":        float(parts[10]) if len(parts) > 10 else 0.0,
-                }
-                rows.append(row)
-            except (ValueError, IndexError):
-                continue
-
-    if not rows:
-        raise ValueError("Could not parse any solution epochs from RTKLIB .pos file.")
+                rows.append({"date":p[0],"time":p[1],"lat":float(p[2]),
+                    "lon":float(p[3]),"height":float(p[4]),"fix_status":int(p[5]),
+                    "num_sats":int(p[6]),"pdop":float(p[7]),
+                    "sdx":float(p[8]) if len(p)>8 else 0.0,
+                    "sdy":float(p[9]) if len(p)>9 else 0.0,
+                    "sdz":float(p[10]) if len(p)>10 else 0.0,
+                })
+            except: continue
+    if not rows: raise ValueError("No epochs parsed from RTKLIB output.")
     return pd.DataFrame(rows)
 
-
-def pos_to_channel_csv(pos_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert RTKLIB position-solution DataFrame into the 88-column
-    channel format (ch0..ch7 × 11 features) that your models expect.
-
-    RTKLIB gives us per-epoch global values (lat, lon, height, pdop, …).
-    We spread these across ch0→ch7 with per-channel variation added via
-    small satellite-index offsets — a best-effort approximation when the
-    raw SDR correlator values are unavailable from RINEX.
-
-    Columns that CANNOT come from RINEX (prompt_i, prompt_q) are set to 0.
-    tracking_flag is set to 1 (assumed tracking since epoch is in solution).
-    """
-    n_rows = len(pos_df)
-    records = []
-
-    # Derived epoch-level features
-    lat    = pos_df["lat"].values
-    lon    = pos_df["lon"].values
-    height = pos_df["height"].values
-    pdop   = pos_df["pdop"].values
-    nsats  = pos_df["num_sats"].values
-    fix    = pos_df["fix_status"].values
-    sdx    = pos_df["sdx"].values
-    sdy    = pos_df["sdy"].values
-    sdz    = pos_df["sdz"].values
-    t_idx  = np.arange(n_rows, dtype=np.float32)
-
-    # Height / position jumps (strong spoofing indicators)
-    h_jump  = np.abs(np.gradient(height))
-    lat_jmp = np.abs(np.gradient(lat))
-    lon_jmp = np.abs(np.gradient(lon))
-
-    for i in range(n_rows):
-        row = {}
+def pos_to_channel_csv(pos_df):
+    lat=pos_df["lat"].values; lon=pos_df["lon"].values
+    height=pos_df["height"].values; pdop=pos_df["pdop"].values
+    h_jump=np.abs(np.gradient(height))
+    lat_j=np.abs(np.gradient(lat)); lon_j=np.abs(np.gradient(lon))
+    records=[]
+    for i in range(len(pos_df)):
+        row={}
         for ch in range(RTKLIB_CHANNELS):
-            # PRN: distribute satellites 1..32 across channels round-robin
-            prn = (ch + 1) + (i % 4)
-
-            # CN0: approximate from PDOP (higher PDOP → lower CN0)
-            # Add small per-channel variation to avoid identical columns
-            cn0 = max(20.0, 45.0 - pdop[i] * 3.0 + ch * 0.5)
-
-            # Doppler: use height jump as a proxy for Doppler anomaly
-            doppler_coarse = h_jump[i] * 10.0 + ch * 0.1
-            doppler_fine   = lat_jmp[i] * 1e4  + lon_jmp[i] * 1e4 + ch * 0.01
-
-            # Carrier phase: use cumulative lat/lon displacement
-            carrier_phase  = lat[i] * 1e6 + lon[i] * 1e6 + ch * 1000.0
-
+            prn=(ch+1)+(i%4)
+            cn0=max(20.0, 45.0-pdop[i]*3.0+ch*0.5)
             row.update({
-                f"ch{ch}_channel_id":    ch,
-                f"ch{ch}_prn":           prn,
-                f"ch{ch}_doppler_coarse": doppler_coarse,
-                f"ch{ch}_tracking_flag":  1,            # assumed tracking
-                f"ch{ch}_sampling_freq":  SAMPLING_FREQ,
-                f"ch{ch}_carrier_phase":  carrier_phase,
-                f"ch{ch}_doppler_fine":   doppler_fine,
-                f"ch{ch}_cn0":            cn0,
-                f"ch{ch}_prompt_i":       0.0,          # not available in RINEX
-                f"ch{ch}_prompt_q":       0.0,          # not available in RINEX
-                f"ch{ch}_time_index":     t_idx[i],
+                f"ch{ch}_channel_id":ch, f"ch{ch}_prn":prn,
+                f"ch{ch}_doppler_coarse":h_jump[i]*10+ch*0.1,
+                f"ch{ch}_tracking_flag":1,
+                f"ch{ch}_sampling_freq":SAMPLING_FREQ,
+                f"ch{ch}_carrier_phase":lat[i]*1e6+lon[i]*1e6+ch*1000,
+                f"ch{ch}_doppler_fine":lat_j[i]*1e4+lon_j[i]*1e4+ch*0.01,
+                f"ch{ch}_cn0":cn0, f"ch{ch}_prompt_i":0.0,
+                f"ch{ch}_prompt_q":0.0, f"ch{ch}_time_index":float(i),
             })
         records.append(row)
-
-    result = pd.DataFrame(records)
-
-    # Ensure exact column order matching your training data (ch0→ch7, 11 cols each)
-    expected_cols = []
-    for ch in range(RTKLIB_CHANNELS):
-        for feat in ["channel_id","prn","doppler_coarse","tracking_flag",
-                     "sampling_freq","carrier_phase","doppler_fine",
-                     "cn0","prompt_i","prompt_q","time_index"]:
-            expected_cols.append(f"ch{ch}_{feat}")
-    result = result[expected_cols]
-    return result
+    expected=[f"ch{ch}_{f}" for ch in range(8)
+              for f in ["channel_id","prn","doppler_coarse","tracking_flag",
+                        "sampling_freq","carrier_phase","doppler_fine",
+                        "cn0","prompt_i","prompt_q","time_index"]]
+    return pd.DataFrame(records)[expected]
 
 
-# ─────────────────────────────────────────────
-# 10. MAIN APP
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. MAIN APP
+# ═══════════════════════════════════════════════════════════════════════════
 def main():
     # ── Sidebar ──────────────────────────────────────────────────────
     with st.sidebar:
@@ -772,306 +572,188 @@ def main():
         st.markdown("## 🛰️ GNSS Spoofing Detector")
         st.markdown("""
         Upload GNSS signal data (CSV, NPY, or RINEX).  
-        The app runs **two independent models** and compares results.
+        The app runs **6 models simultaneously** and compares results.
 
         ---
-        **🛰️ NEW — RTKLIB Pipeline**  
-        Upload raw RINEX files in Section 0.  
-        RTKLIB converts them to model-ready features automatically.
+        **🛰️ RTKLIB Pipeline**  
+        Upload raw RINEX files in Section 0.
 
         ---
-        **Model A — SVC (RBF)**  
-        Sklearn Support Vector Classifier  
-        Input: 352 window statistics
+        **ML Models**  
+        • SVM | • Random Forest  
+        Input: 256 window statistics
 
-        **Model B — BiLSTM**  
-        PyTorch Bidirectional LSTM + Attention  
-        Input: (window, 88) sequences
-        
+        **DL Models**  
+        • Attention-BiLSTM  
+        • CNN-LSTM  
+        • Transformer  
+        • Transformer-Attention  
+        Input: (30, 55) sequences
+
         ---
-        **Labels** (if column `label` present):  
-        `0` = Clean signal  
-        `1` = Spoofed signal
+        **Labels** (if `label` column present):  
+        `0` = Clean · `1` = Spoofed
         """)
         st.markdown("---")
-        window_override = st.slider(
-            "Window size", 10, 60, WINDOW,
-            help="Sliding-window length used to segment the signal."
-        )
+        window_override = st.slider("Window size", 10, 60, WINDOW,
+                                    help="Sliding-window length.")
 
     # ── Header ───────────────────────────────────────────────────────
-    st.title("🛰️ GNSS Spoofing Detection — Dual Model Comparison")
-    st.markdown("*Supports CSV · NPY · RINEX — automatic preprocessing & side-by-side model comparison*")
+    st.title("🛰️ GNSS Spoofing Detection — Six Model Comparison")
+    st.markdown("*Supports CSV · NPY · RINEX — automatic preprocessing & six-model comparison*")
 
     # ── Load models ──────────────────────────────────────────────────
     with st.spinner("Loading models…"):
-        try:
-            svc, dl_model, device = load_models()
-            st.success("✅ Both models loaded successfully.", icon="🤖")
-        except FileNotFoundError as exc:
-            st.error(f"Model file not found: {exc}\n\n"
-                     "Place `best_model.pkl` and `best_dl_model.pkl` "
-                     "in the same folder as `app.py`.")
-            st.stop()
-        except Exception as exc:
-            st.error(f"Error loading models: {exc}")
-            st.stop()
+        models, load_errors, device = load_all_models()
 
-    # ── SECTION 0 — RTKLIB RINEX Preprocessing ───────────────────────
+    loaded = [n for n in ALL_MODELS if n in models]
+    failed = [n for n in ALL_MODELS if n in load_errors]
+
+    if loaded:
+        st.success(f"✅ {len(loaded)}/6 models loaded: {', '.join(loaded)}", icon="🤖")
+    if failed:
+        with st.expander(f"⚠️ {len(failed)} model(s) failed to load"):
+            for n in failed:
+                st.error(f"**{n}**: {load_errors[n]}")
+    if not loaded:
+        st.error("No models loaded. Place model files in the app root folder.")
+        st.stop()
+
+    # ── SECTION 0 — RTKLIB ───────────────────────────────────────────
     st.markdown('<div class="section-header">🛰️ Section 0 — RTKLIB Preprocessing (RINEX → Features)</div>',
                 unsafe_allow_html=True)
-
-    with st.expander("📡 Convert RINEX files using RTKLIB (optional — skip if uploading CSV directly)", expanded=False):
-        st.markdown("""
-        Upload a **RINEX Observation file** and a **RINEX Navigation file**.  
-        RTKLIB will process them and generate a feature CSV compatible with your trained models.  
-        The converted CSV will be passed automatically to Section 1.
-        """)
-
-        # Only show manual path input on Windows
+    with st.expander("📡 Convert RINEX files using RTKLIB (skip if uploading CSV)", expanded=False):
         if os.name == "nt":
             rtklib_path_input = st.text_input(
-                "RTKLIB rnx2rtkp.exe path (leave blank to auto-detect from PATH)",
-                value="",
-                placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
-            )
+                "rnx2rtkp.exe path (blank = auto-detect)",
+                placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe")
         else:
             rtklib_path_input = ""
             if is_rtklib_installed():
-                st.success("✅ RTKLIB is already installed on the server and ready to use.")
+                st.success("✅ RTKLIB ready on server.")
             else:
-                st.info("🔧 RTKLIB will be automatically compiled on the server when you click **Run RTKLIB** (takes ~2 minutes on first run only).")
+                st.info("🔧 RTKLIB will auto-install on first run (~2 min).")
 
-        # ── Navigation file auto-downloader ──────────────────────────
         st.markdown("---")
-        st.markdown("#### 📥 Don't have a Navigation file? Download it automatically")
-        st.markdown("Enter the **date of your Observation file** and we'll download the matching navigation file from IGS:")
-
-        col_y, col_m, col_d = st.columns(3)
-        with col_y:
-            nav_year  = st.number_input("Year",  min_value=2000, max_value=2030, value=2023, step=1)
-        with col_m:
-            nav_month = st.number_input("Month", min_value=1,    max_value=12,   value=10,   step=1)
-        with col_d:
-            nav_day   = st.number_input("Day",   min_value=1,    max_value=31,   value=5,    step=1)
-
+        st.markdown("#### 📥 Auto-download Navigation file")
+        cy, cm_, cd = st.columns(3)
+        nav_year  = cy.number_input("Year",  2000, 2030, 2023, step=1)
+        nav_month = cm_.number_input("Month", 1, 12, 10, step=1)
+        nav_day   = cd.number_input("Day",   1, 31, 5,  step=1)
         if st.button("📥 Download Navigation File from IGS", type="secondary"):
-            with st.spinner(f"Downloading navigation file for {int(nav_year)}-{int(nav_month):02d}-{int(nav_day):02d}…"):
+            with st.spinner("Downloading…"):
                 try:
-                    tmp_nav_dir = tempfile.mkdtemp()
-                    nav_dl_path = download_nav_file(
-                        int(nav_year), int(nav_month), int(nav_day), tmp_nav_dir
-                    )
-                    with open(nav_dl_path, "rb") as f:
-                        nav_bytes = f.read()
-
-                    st.success(f"✅ Navigation file downloaded! ({len(nav_bytes)/1024:.1f} KB)")
-                    st.download_button(
-                        "⬇️ Save Navigation file (.nav) to your PC",
-                        data=nav_bytes,
-                        file_name=os.path.basename(nav_dl_path),
-                        mime="application/octet-stream",
-                    )
-                    # Store in session for use in RTKLIB run
-                    st.session_state["downloaded_nav_bytes"] = nav_bytes
-                    st.session_state["downloaded_nav_name"]  = os.path.basename(nav_dl_path)
-                    st.info("✅ Navigation file is ready — upload your Observation file below and click Run RTKLIB.")
-
-                except RuntimeError as e:
-                    st.error(f"❌ {e}")
+                    tmp = tempfile.mkdtemp()
+                    p   = download_nav_file(int(nav_year),int(nav_month),int(nav_day),tmp)
+                    nb  = open(p,"rb").read()
+                    st.success(f"✅ Downloaded ({len(nb)/1024:.1f} KB)")
+                    st.download_button("⬇️ Save nav file", data=nb,
+                                       file_name=os.path.basename(p),
+                                       mime="application/octet-stream")
+                    st.session_state["downloaded_nav_bytes"] = nb
+                    st.session_state["downloaded_nav_name"]  = os.path.basename(p)
                 except Exception as e:
-                    st.error(f"❌ Download failed: {e}")
+                    st.error(f"❌ {e}")
 
         st.markdown("---")
         st.markdown("#### 📂 Upload RINEX files")
+        st.warning("⚠️ Rename `.23o`→`_obs.rnx` and `.23n`→`_nav.rnx` before uploading.")
+        co, cn = st.columns(2)
+        obs_file = co.file_uploader("📄 Observation (.rnx/.obs/.txt)",
+                                    type=["rnx","obs","rnx3","txt"], key="rtklib_obs")
+        if st.session_state.get("downloaded_nav_bytes"):
+            cn.success(f"✅ Nav ready: `{st.session_state.get('downloaded_nav_name')}`")
+            nav_file = None
+        else:
+            nav_file = cn.file_uploader("📄 Navigation (.rnx/.nav/.txt)",
+                                        type=["nav","rnx","rnx3","txt"], key="rtklib_nav")
 
-        st.warning(
-            "⚠️ **Important — Rename your files before uploading!**\n\n"
-            "Streamlit does not support extensions starting with numbers (`.23o`, `.23n`).\n\n"
-            "Please rename your files like this:\n"
-            "- `01052270.23o` → rename to → `01052270_obs.rnx`\n"
-            "- `01052270.23n` → rename to → `01052270_nav.rnx`\n\n"
-            "The file content stays exactly the same — only the extension changes."
-        )
-
-        col_obs, col_nav = st.columns(2)
-        with col_obs:
-            obs_file = st.file_uploader(
-                "📄 RINEX Observation file (.rnx / .obs / .txt)",
-                type=["rnx", "obs", "rnx3", "txt"],
-                key="rtklib_obs",
-            )
-        with col_nav:
-            # Show note if nav was auto-downloaded
-            if st.session_state.get("downloaded_nav_bytes"):
-                st.success(f"✅ Navigation file ready: `{st.session_state.get('downloaded_nav_name')}`  \nNo need to upload — it was downloaded above.")
-                nav_file = None
-            else:
-                nav_file = st.file_uploader(
-                    "📄 RINEX Navigation file (.rnx / .nav / .txt)",
-                    type=["nav", "rnx", "rnx3", "txt"],
-                    key="rtklib_nav",
-                )
-
-        # Determine if we have nav from download or upload
-        nav_ready = (
-            nav_file is not None or
-            st.session_state.get("downloaded_nav_bytes") is not None
-        )
+        nav_ready = nav_file is not None or st.session_state.get("downloaded_nav_bytes") is not None
 
         if obs_file and nav_ready:
             if st.button("🚀 Run RTKLIB & Convert to Features", type="primary"):
-                install_status = st.empty()
-                with st.spinner("Running RTKLIB — this may take 1–3 minutes on first run (compiling on server)…"):
+                ph = st.empty()
+                with st.spinner("Running RTKLIB…"):
                     try:
-                        # ── Resolve rnx2rtkp: Windows path input OR auto-install on Linux ──
-                        if rtklib_path_input.strip():
-                            exe = rtklib_path_input.strip()
-                            if not os.path.isfile(exe):
-                                raise FileNotFoundError(f"Not found: {exe}")
-                        else:
-                            install_status.info("🔧 Checking RTKLIB on server…")
-                            exe = get_rtklib_exe(install_status)
-
-                        install_status.success(f"✅ RTKLIB ready at: `{exe}`")
-
+                        exe = (rtklib_path_input.strip() if rtklib_path_input.strip()
+                               else get_rtklib_exe(ph))
+                        ph.success(f"✅ RTKLIB at `{exe}`")
                         with tempfile.TemporaryDirectory() as tmp:
-                            # Save observation file
                             obs_path = os.path.join(tmp, obs_file.name)
-                            with open(obs_path, "wb") as f:
-                                f.write(obs_file.read())
-
-                            # Save navigation file (uploaded or downloaded)
-                            if nav_file is not None:
+                            open(obs_path,"wb").write(obs_file.read())
+                            if nav_file:
                                 nav_path = os.path.join(tmp, nav_file.name)
-                                with open(nav_path, "wb") as f:
-                                    f.write(nav_file.read())
+                                open(nav_path,"wb").write(nav_file.read())
                             else:
-                                nav_name = st.session_state["downloaded_nav_name"]
-                                nav_path = os.path.join(tmp, nav_name)
-                                with open(nav_path, "wb") as f:
-                                    f.write(st.session_state["downloaded_nav_bytes"])
-
-                            st.info(f"📁 Obs: `{os.path.basename(obs_path)}`  |  Nav: `{os.path.basename(nav_path)}`")
-
-                            # Run RTKLIB
-                            pos_path = run_rnx2rtkp(obs_path, nav_path, exe, tmp)
-                            st.success("✅ RTKLIB processing complete!")
-
-                            pos_df = parse_pos_file(pos_path)
-                            st.info(f"📊 Parsed {len(pos_df)} solution epochs from RTKLIB")
-
-                            with st.expander("🔍 RTKLIB raw solution (first 20 epochs)"):
-                                st.dataframe(pos_df.head(20), use_container_width=True)
-                                c1, c2, c3 = st.columns(3)
-                                c1.metric("Total epochs", len(pos_df))
-                                c2.metric("Avg satellites", f"{pos_df['num_sats'].mean():.1f}")
-                                c3.metric("Avg PDOP", f"{pos_df['pdop'].mean():.2f}")
-
-                            channel_df = pos_to_channel_csv(pos_df)
-                            st.success(f"✅ Converted → {channel_df.shape[0]} rows × {channel_df.shape[1]} cols")
-
-                            st.session_state["rtklib_csv"] = channel_df
-
-                            st.download_button(
-                                "⬇️ Download converted features CSV",
-                                data=channel_df.to_csv(index=False).encode(),
-                                file_name="rtklib_features.csv",
-                                mime="text/csv",
-                            )
-                            st.info("👇 Scroll down — the converted data has been loaded into Section 1 automatically.")
-
-                    except FileNotFoundError as e:
-                        st.error(f"❌ RTKLIB not found: {e}\n\n"
-                                 "Please enter the full path to rnx2rtkp.exe in the field above.")
-                    except RuntimeError as e:
-                        st.error(f"❌ RTKLIB failed:\n{e}")
+                                nav_path = os.path.join(tmp, st.session_state["downloaded_nav_name"])
+                                open(nav_path,"wb").write(st.session_state["downloaded_nav_bytes"])
+                            pos  = run_rnx2rtkp(obs_path, nav_path, exe, tmp)
+                            pdf  = parse_pos_file(pos)
+                            st.success(f"✅ {len(pdf)} epochs parsed")
+                            with st.expander("RTKLIB solution preview"):
+                                st.dataframe(pdf.head(20), use_container_width=True)
+                            cdf = pos_to_channel_csv(pdf)
+                            st.success(f"✅ Converted → {cdf.shape}")
+                            st.session_state["rtklib_csv"] = cdf
+                            st.download_button("⬇️ Download features CSV",
+                                               data=cdf.to_csv(index=False).encode(),
+                                               file_name="rtklib_features.csv", mime="text/csv")
                     except Exception as e:
-                        st.error(f"❌ Unexpected error: {e}")
-
-        elif obs_file and not nav_ready:
-            st.warning("⚠️ Navigation file needed — either download it above or upload it manually.")
-        elif not obs_file and nav_ready:
-            st.warning("⚠️ Please upload your Observation file (.obs / .23O).")
+                        st.error(f"❌ {e}")
+        elif obs_file:
+            st.warning("⚠️ Navigation file needed.")
         else:
-            st.info("📋 Steps:  1️⃣ Download nav file above (or upload it)  →  2️⃣ Upload your Observation file  →  3️⃣ Click Run RTKLIB")
+            st.info("📋 1️⃣ Download nav → 2️⃣ Upload obs → 3️⃣ Run RTKLIB")
 
     # ── SECTION 1 — Upload ───────────────────────────────────────────
     st.markdown('<div class="section-header">📂 Section 1 — Upload Data</div>',
                 unsafe_allow_html=True)
-
-    rtklib_result = st.session_state.get("rtklib_csv", None)
+    rtklib_result = st.session_state.get("rtklib_csv")
     if rtklib_result is not None:
         st.success("✅ Using RTKLIB-converted features from Section 0.")
-
-    uploaded = st.file_uploader(
-        "Upload a GNSS data file",
-        type=["csv", "npy", "obs", "rnx", "txt"],
-        help="Accepted: .csv (preferred), .npy (numpy array), .obs/.rnx/.txt (RINEX obs). "
-             "Skip this if you already ran RTKLIB above.",
-    )
-
+    uploaded = st.file_uploader("Upload a GNSS data file",
+                                type=["csv","npy","obs","rnx","txt"],
+                                help="CSV preferred. Skip if you ran RTKLIB above.")
     if uploaded is None and rtklib_result is None:
-        st.info("👆 Either run RTKLIB in Section 0 to convert RINEX files, "
-                "or upload a CSV/NPY file here directly.")
+        st.info("👆 Run RTKLIB above or upload a CSV/NPY file.")
         st.stop()
 
     # ── SECTION 2 — Preprocessing ────────────────────────────────────
     st.markdown('<div class="section-header">⚙️ Section 2 — Preprocessing & Format Conversion</div>',
                 unsafe_allow_html=True)
-
-    with st.spinner("Parsing and converting file…"):
+    with st.spinner("Parsing file…"):
         try:
-            # ── Priority: use RTKLIB output if available ──────────────
             if rtklib_result is not None and uploaded is None:
                 df = rtklib_result.copy()
-                st.success(f"✅ Using RTKLIB features → {df.shape[0]} rows, {df.shape[1]} cols.")
-
-            elif uploaded is not None:
-                raw_bytes = uploaded.read()
-                fname     = uploaded.name.lower()
-
-                # ── NPY → DataFrame ──────────────────────────────────
-                if fname.endswith(".npy"):
-                    arr = np.load(io.BytesIO(raw_bytes), allow_pickle=True)
+                st.success(f"✅ RTKLIB features → {df.shape[0]} rows, {df.shape[1]} cols.")
+            else:
+                raw  = uploaded.read()
+                name = uploaded.name.lower()
+                if name.endswith(".npy"):
+                    arr = np.load(io.BytesIO(raw), allow_pickle=True)
                     df  = npy_to_dataframe(arr)
-                    st.success(f"✅ NPY array {arr.shape} converted to DataFrame.")
-
-                # ── RINEX obs → DataFrame ─────────────────────────────
-                elif fname.endswith((".obs", ".rnx")):
-                    text = raw_bytes.decode("utf-8", errors="ignore")
-                    df   = rinex_to_dataframe(text)
-                    st.success(f"✅ RINEX file parsed → {df.shape[0]} rows, {df.shape[1]} cols.")
-
-                # ── CSV / TXT ─────────────────────────────────────────
+                    st.success(f"✅ NPY {arr.shape} loaded.")
+                elif name.endswith((".obs",".rnx")):
+                    df  = rinex_to_dataframe(raw.decode("utf-8","ignore"))
+                    st.success(f"✅ RINEX parsed → {df.shape}.")
                 else:
-                    df = pd.read_csv(io.BytesIO(raw_bytes))
+                    df  = pd.read_csv(io.BytesIO(raw))
                     st.success(f"✅ CSV loaded → {df.shape[0]} rows, {df.shape[1]} cols.")
-
-            # Clean column names
             df = remove_duplicate_cols(clean_columns(df))
+        except Exception as e:
+            st.error(f"❌ Parse error: {e}"); st.stop()
 
-        except Exception as exc:
-            st.error(f"❌ Could not parse file: {exc}")
-            st.stop()
-
-    # Offer converted CSV download
-    csv_bytes = df.to_csv(index=False).encode()
     st.download_button("⬇️ Download converted CSV",
-                       data=csv_bytes,
-                       file_name="converted_data.csv",
-                       mime="text/csv")
-
-    # Show data preview
-    with st.expander("🔍 Preview converted data (first 50 rows)", expanded=False):
+                       data=df.to_csv(index=False).encode(),
+                       file_name="converted_data.csv", mime="text/csv")
+    with st.expander("🔍 Preview (first 50 rows)", expanded=False):
         st.dataframe(df.head(50), use_container_width=True)
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Rows",    df.shape[0])
-        col2.metric("Columns", df.shape[1])
-        col3.metric("Label col present",
-                    "Yes ✅" if "label" in df.columns else "No ⚠️")
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Rows", df.shape[0])
+        c2.metric("Columns", df.shape[1])
+        c3.metric("Label col", "Yes ✅" if "label" in df.columns else "No ⚠️")
 
-    # Separate label column if present
+    # Separate labels
     if "label" in df.columns:
         labels_raw = df["label"].values
         df_feat    = df.drop(columns=["label"])
@@ -1079,224 +761,228 @@ def main():
         labels_raw = None
         df_feat    = df.copy()
 
-    # Keep only numeric columns
     df_feat = df_feat.select_dtypes(include=[np.number])
     if df_feat.shape[1] == 0:
-        st.error("No numeric feature columns found after preprocessing.")
-        st.stop()
+        st.error("No numeric feature columns found."); st.stop()
 
-    # Scale features
-    scaler  = StandardScaler()
-    scaled  = pd.DataFrame(
-        scaler.fit_transform(df_feat),
-        columns=df_feat.columns
-    )
+    scaler = StandardScaler()
+    scaled = pd.DataFrame(scaler.fit_transform(df_feat), columns=df_feat.columns)
 
-    # ── SECTION 3 — Prediction ───────────────────────────────────────
-    st.markdown('<div class="section-header">🔮 Section 3 — Running Predictions</div>',
+    # ── SECTION 3 — Predictions ──────────────────────────────────────
+    st.markdown('<div class="section-header">🔮 Section 3 — Running Predictions (All 6 Models)</div>',
                 unsafe_allow_html=True)
 
-    win = window_override   # user can adjust from sidebar
+    win = window_override
 
-    # ── Feature engineering for SVC ──────────────────────────────────
-    aligned_ml = align_features(scaled.copy(), DL_INPUT_DIM)   # 88 raw cols
-    X_win      = build_window_features(aligned_ml, window=win)
+    # Build ML features (256-dim)
+    ml_aligned = align_features(scaled.copy(), ML_N_FEATURES)
+    X_ml_raw   = build_ml_features(ml_aligned, window=win)
+    X_ml       = pad_or_trim(X_ml_raw, ML_N_FEATURES)
 
-    if X_win.shape[1] != ML_N_FEATURES:
-        # Pad / trim to exactly 352
-        if X_win.shape[1] < ML_N_FEATURES:
-            pad   = np.zeros((X_win.shape[0], ML_N_FEATURES - X_win.shape[1]))
-            X_win = np.hstack([X_win, pad])
-        else:
-            X_win = X_win[:, :ML_N_FEATURES]
+    # Build DL sequences (N, 30, 55)
+    dl_aligned = align_features(scaled.copy(), DL_INPUT_DIM)
+    X_dl       = build_sequences(dl_aligned, window=win)
+    if X_dl.shape[2] != DL_INPUT_DIM:
+        pad = np.zeros((X_dl.shape[0], X_dl.shape[1], DL_INPUT_DIM - X_dl.shape[2]),
+                       dtype=np.float32)
+        X_dl = np.concatenate([X_dl, pad], axis=2) if X_dl.shape[2] < DL_INPUT_DIM \
+               else X_dl[:, :, :DL_INPUT_DIM]
 
-    # ── Sequences for BiLSTM ─────────────────────────────────────────
-    aligned_dl = align_features(scaled.copy(), DL_INPUT_DIM)
-    X_seq      = build_sequences(aligned_dl, window=win)  # (N, win, 88)
+    n_win = min(len(X_ml), len(X_dl))
+    if n_win == 0:
+        st.error(f"Not enough rows for window size {win}."); st.stop()
 
-    n_windows = min(len(X_win), len(X_seq))
-    if n_windows == 0:
-        st.error(f"Not enough rows to form even one window of size {win}. "
-                 f"Upload a file with at least {win + 1} rows.")
-        st.stop()
+    X_ml = X_ml[:n_win]; X_dl = X_dl[:n_win]
 
-    X_win = X_win[:n_windows]
-    X_seq = X_seq[:n_windows]
     if labels_raw is not None:
-        # Align labels to windows
-        y_win = np.array([
-            int(np.any(labels_raw[i * win : (i + 1) * win]))
-            for i in range(n_windows)
-        ])
+        y_win = np.array([int(np.any(labels_raw[i*win:(i+1)*win])) for i in range(n_win)])
     else:
         y_win = None
 
-    st.info(f"📊 {n_windows} windows of size {win} built from {df_feat.shape[0]} rows.")
+    st.info(f"📊 {n_win} windows of size {win} built from {df_feat.shape[0]} rows.")
 
-    col_a, col_b = st.columns(2)
+    # ── Run all models ────────────────────────────────────────────────
+    results = {}
+    progress = st.progress(0, text="Running models…")
+    for idx, name in enumerate(ALL_MODELS):
+        if name not in models:
+            progress.progress((idx+1)/len(ALL_MODELS))
+            continue
+        try:
+            if name in ML_MODELS:
+                preds, proba = predict_ml(models[name], X_ml)
+            else:
+                preds, proba = predict_dl(models[name], X_dl, device)
+            results[name] = {"preds": preds, "proba": proba}
+        except Exception as e:
+            st.warning(f"⚠️ {name} inference failed: {e}")
+        progress.progress((idx+1)/len(ALL_MODELS), text=f"✅ {name} done")
 
-    with col_a:
-        st.markdown("#### 🔵 Model A — SVC (RBF)")
-        with st.spinner("Running SVC inference…"):
-            preds_svc, proba_svc = predict_svc(svc, X_win)
-        spoof_pct_svc = 100 * preds_svc.mean()
-        st.metric("Spoofed windows detected",
-                  f"{preds_svc.sum()} / {n_windows}",
-                  delta=f"{spoof_pct_svc:.1f}%")
-        lbl = ("🔴 SPOOFING DETECTED" if spoof_pct_svc > 40
-               else "🟢 Signal appears clean")
-        st.markdown(f'<span class="{"alert-spoof" if spoof_pct_svc > 40 else "alert-clean"}">'
-                    f'{lbl}</span>', unsafe_allow_html=True)
+    progress.empty()
 
-    with col_b:
-        st.markdown("#### 🔴 Model B — BiLSTM Attention")
-        with st.spinner("Running BiLSTM inference…"):
-            preds_dl, proba_dl = predict_bilstm(dl_model, X_seq, device)
-        spoof_pct_dl = 100 * preds_dl.mean()
-        st.metric("Spoofed windows detected",
-                  f"{preds_dl.sum()} / {n_windows}",
-                  delta=f"{spoof_pct_dl:.1f}%")
-        lbl = ("🔴 SPOOFING DETECTED" if spoof_pct_dl > 40
-               else "🟢 Signal appears clean")
-        st.markdown(f'<span class="{"alert-spoof" if spoof_pct_dl > 40 else "alert-clean"}">'
-                    f'{lbl}</span>', unsafe_allow_html=True)
+    if not results:
+        st.error("All model inferences failed."); st.stop()
 
-    # Prediction timeline
-    st.plotly_chart(pred_timeline(preds_svc, preds_dl),
-                    use_container_width=True)
+    # ── Summary table ─────────────────────────────────────────────────
+    st.markdown("### 📋 Results Summary")
+    summary_rows = []
+    for name, res in results.items():
+        spoof_n   = int(res["preds"].sum())
+        spoof_pct = 100 * res["preds"].mean()
+        avg_prob  = 100 * res["proba"].mean()
+        verdict   = "🔴 SPOOFING DETECTED" if spoof_pct > 40 else "🟢 Clean"
+        summary_rows.append({
+            "Model":               name,
+            "Verdict":             verdict,
+            "Spoofing Prob (%)":   f"{avg_prob:.1f}%",
+            "Spoofed Windows":     f"{spoof_n} / {n_win}",
+            "Spoofed %":           f"{spoof_pct:.1f}%",
+        })
+    st.dataframe(pd.DataFrame(summary_rows).set_index("Model"),
+                 use_container_width=True)
+
+    # ── Per-model metric cards ────────────────────────────────────────
+    cols = st.columns(min(3, len(results)))
+    for i, (name, res) in enumerate(results.items()):
+        with cols[i % 3]:
+            spoof_pct = 100 * res["preds"].mean()
+            st.metric(
+                label=name,
+                value=f"{res['preds'].sum()} / {n_win} spoofed",
+                delta=f"{spoof_pct:.1f}%",
+            )
+            color = "alert-spoof" if spoof_pct > 40 else "alert-clean"
+            verdict = "🔴 SPOOFING DETECTED" if spoof_pct > 40 else "🟢 Clean"
+            st.markdown(f'<span class="{color}">{verdict}</span>', unsafe_allow_html=True)
 
     # ── SECTION 4 — Comparison ───────────────────────────────────────
     st.markdown('<div class="section-header">📊 Section 4 — Model Comparison</div>',
                 unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📈 Metrics", "🗺️ Confusion Matrices", "📉 Distributions", "📋 Raw Predictions"]
-    )
+    tab_metrics, tab_cm, tab_prob, tab_timeline, tab_best, tab_export = st.tabs([
+        "📈 Metrics", "🗺️ Confusion Matrices",
+        "📉 Probabilities", "📋 Timeline",
+        "🏆 Best Model", "⬇️ Export",
+    ])
 
-    # ── Tab 1 — Metrics ──────────────────────────────────────────────
-    with tab1:
+    # ── Metrics Tab ──────────────────────────────────────────────────
+    with tab_metrics:
         if y_win is not None and len(np.unique(y_win)) > 1:
-            m_svc = compute_metrics(y_win, preds_svc, proba_svc, "SVC")
-            m_dl  = compute_metrics(y_win, preds_dl,  proba_dl,  "BiLSTM")
+            metrics_list = []
+            for name, res in results.items():
+                metrics_list.append(
+                    compute_metrics(y_win, res["preds"], res["proba"], name))
 
-            # Metrics table
-            mdf = pd.DataFrame([m_svc, m_dl]).set_index("model")
-            mdf_display = (mdf * 100).round(2).astype(str) + " %"
-            st.dataframe(mdf_display, use_container_width=True)
-
-            # Radar
-            st.plotly_chart(metric_radar([m_svc, m_dl]),
-                            use_container_width=True)
+            mdf = pd.DataFrame(metrics_list).set_index("model")
+            st.dataframe(
+                (mdf * 100).round(2).astype(str).add(" %"),
+                use_container_width=True,
+            )
 
             # Bar chart
+            metric_names = ["accuracy","f1","precision","recall","auc_roc"]
             fig_bar = go.Figure()
-            metric_names = ["accuracy", "f1", "precision", "recall", "auc_roc"]
-            for m, color in zip([m_svc, m_dl], ["#1a73e8", "#e84e1a"]):
+            for m in metrics_list:
                 fig_bar.add_trace(go.Bar(
                     name=m["model"],
-                    x=[mn.replace("_", " ").title() for mn in metric_names],
+                    x=[mn.replace("_"," ").title() for mn in metric_names],
                     y=[m[mn] for mn in metric_names],
-                    marker_color=color,
+                    marker_color=MODEL_COLORS.get(m["model"],"#888"),
                     text=[f"{m[mn]*100:.1f}%" for mn in metric_names],
                     textposition="outside",
                 ))
             fig_bar.update_layout(
-                barmode="group", title="Side-by-Side Metric Comparison",
-                yaxis=dict(range=[0, 1.15]), height=380,
-                margin=dict(t=50, b=20),
-                legend=dict(orientation="h"),
+                barmode="group", title="All-Model Metric Comparison",
+                yaxis=dict(range=[0,1.2]), height=420,
+                margin=dict(t=50,b=20), legend=dict(orientation="h"),
             )
             st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(metric_radar(metrics_list), use_container_width=True)
 
-            # ── Winner ───────────────────────────────────────────────
-            st.markdown("---")
-            if m_svc["f1"] > m_dl["f1"]:
-                winner = f"🏆 SVC (F1 = {m_svc['f1']*100:.1f}% vs {m_dl['f1']*100:.1f}%)"
-            elif m_dl["f1"] > m_svc["f1"]:
-                winner = f"🏆 BiLSTM Attention (F1 = {m_dl['f1']*100:.1f}% vs {m_svc['f1']*100:.1f}%)"
-            else:
-                winner = "🤝 Tie — both models perform equally (F1)"
-            st.markdown(f'<div class="winner-banner">{winner} performs better on this dataset</div>',
-                        unsafe_allow_html=True)
-
-            # Detailed classification reports
-            with st.expander("📄 Detailed Classification Reports"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**SVC Report**")
-                    st.text(classification_report(y_win, preds_svc,
-                                                  target_names=["Clean", "Spoofed"],
-                                                  zero_division=0))
-                with c2:
-                    st.markdown("**BiLSTM Report**")
-                    st.text(classification_report(y_win, preds_dl,
-                                                  target_names=["Clean", "Spoofed"],
+            with st.expander("📄 Classification Reports"):
+                for name, res in results.items():
+                    st.markdown(f"**{name}**")
+                    st.text(classification_report(y_win, res["preds"],
+                                                  target_names=["Clean","Spoofed"],
                                                   zero_division=0))
         else:
-            st.warning(
-                "No `label` column found (or only one class present). "
-                "Accuracy metrics require ground-truth labels. "
-                "The prediction timeline and distribution charts are still available."
-            )
+            st.info("Add a `label` column to your CSV to see accuracy metrics.")
 
-    # ── Tab 2 — Confusion matrices ───────────────────────────────────
-    with tab2:
+    # ── Confusion Matrices Tab ───────────────────────────────────────
+    with tab_cm:
         if y_win is not None and len(np.unique(y_win)) > 1:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.plotly_chart(confusion_heatmap(y_win, preds_svc, "SVC Confusion Matrix"),
-                                use_container_width=True)
-            with c2:
-                st.plotly_chart(confusion_heatmap(y_win, preds_dl, "BiLSTM Confusion Matrix"),
-                                use_container_width=True)
+            names = list(results.keys())
+            for row_start in range(0, len(names), 3):
+                cols_ = st.columns(3)
+                for j, name in enumerate(names[row_start:row_start+3]):
+                    with cols_[j]:
+                        res = results[name]
+                        st.plotly_chart(
+                            confusion_heatmap(y_win, res["preds"], name),
+                            use_container_width=True,
+                        )
         else:
-            st.info("Confusion matrices require ground-truth labels in a `label` column.")
+            st.info("Confusion matrices require a `label` column.")
 
-    # ── Tab 3 — Probability distributions ───────────────────────────
-    with tab3:
-        st.plotly_chart(proba_histogram(proba_svc, proba_dl),
-                        use_container_width=True)
+    # ── Probabilities Tab ────────────────────────────────────────────
+    with tab_prob:
+        st.plotly_chart(proba_hist_fig(results), use_container_width=True)
+        st.plotly_chart(proba_timeline_fig(results), use_container_width=True)
 
-        # Avg probability per window (line chart)
-        fig_p = go.Figure()
-        fig_p.add_trace(go.Scatter(y=proba_svc, name="SVC P(Spoofed)",
-                                   line=dict(color="#1a73e8")))
-        fig_p.add_trace(go.Scatter(y=proba_dl,  name="BiLSTM P(Spoofed)",
-                                   line=dict(color="#e84e1a", dash="dash")))
-        fig_p.update_layout(title="Spoofing Probability per Window",
-                            xaxis_title="Window index",
-                            yaxis_title="P(Spoofed)",
-                            height=320,
-                            margin=dict(t=50, b=20),
-                            legend=dict(orientation="h"))
-        st.plotly_chart(fig_p, use_container_width=True)
+    # ── Timeline Tab ─────────────────────────────────────────────────
+    with tab_timeline:
+        st.plotly_chart(pred_timeline_fig(results), use_container_width=True)
 
-    # ── Tab 4 — Raw predictions table ────────────────────────────────
-    with tab4:
-        result_df = pd.DataFrame({
-            "Window":         range(n_windows),
-            "SVC Prediction": ["Spoofed" if p else "Clean" for p in preds_svc],
-            "SVC P(Spoofed)": proba_svc.round(4),
-            "BiLSTM Prediction": ["Spoofed" if p else "Clean" for p in preds_dl],
-            "BiLSTM P(Spoofed)": proba_dl.round(4),
-        })
+    # ── Best Model Tab ───────────────────────────────────────────────
+    with tab_best:
+        if y_win is not None and len(np.unique(y_win)) > 1:
+            metrics_list = [compute_metrics(y_win, res["preds"], res["proba"], name)
+                            for name, res in results.items()]
+            best = max(metrics_list, key=lambda m: m["f1"])
+            st.markdown(f"""
+            <div class="winner-banner">
+                🏆 Best Model: {best['model']}<br>
+                <span style="font-size:.9rem;font-weight:400">
+                F1 = {best['f1']*100:.1f}% · Accuracy = {best['accuracy']*100:.1f}%
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("#### Best Model Metrics")
+            best_df = pd.DataFrame([{
+                "Accuracy":  f"{best['accuracy']*100:.2f}%",
+                "Precision": f"{best['precision']*100:.2f}%",
+                "Recall":    f"{best['recall']*100:.2f}%",
+                "F1 Score":  f"{best['f1']*100:.2f}%",
+                "ROC-AUC":   f"{best['auc_roc']*100:.2f}%",
+            }])
+            st.dataframe(best_df, use_container_width=True)
+        else:
+            st.info("Best model selection requires a `label` column.")
+
+    # ── Export Tab ───────────────────────────────────────────────────
+    with tab_export:
+        export = {"Window": list(range(n_win))}
         if y_win is not None:
-            result_df.insert(1, "True Label",
-                             ["Spoofed" if y else "Clean" for y in y_win])
-
-        st.dataframe(result_df, use_container_width=True, height=400)
+            export["True Label"] = ["Spoofed" if y else "Clean" for y in y_win]
+        for name, res in results.items():
+            safe = name.replace(" ","_").replace("-","_")
+            export[f"{safe}_Prediction"] = ["Spoofed" if p else "Clean"
+                                            for p in res["preds"]]
+            export[f"{safe}_Probability"] = res["proba"].round(4)
+        export_df = pd.DataFrame(export)
+        st.dataframe(export_df, use_container_width=True, height=400)
         st.download_button(
-            "⬇️ Download predictions CSV",
-            data=result_df.to_csv(index=False).encode(),
-            file_name="predictions.csv",
+            "⬇️ Download All Predictions CSV",
+            data=export_df.to_csv(index=False).encode(),
+            file_name="all_predictions.csv",
             mime="text/csv",
         )
 
-    # ── Footer ───────────────────────────────────────────────────────
     st.markdown("---")
     st.caption(
-        "GNSS Spoofing Detection App · SVC (RBF) vs BiLSTM-Attention · "
-        "Built with Streamlit · Model inputs: 352-dim stats (SVC) | (win × 88) sequences (BiLSTM)"
+        "GNSS Spoofing Detection · 6-Model Comparison · "
+        "ML: SVM, Random Forest (256 features) · "
+        "DL: Attention-BiLSTM, CNN-LSTM, Transformer, Transformer-Attention (30×55 sequences)"
     )
 
 
