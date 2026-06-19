@@ -180,6 +180,13 @@ class TransformerAttentionModel(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. MODEL LOADING
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Resolve paths relative to this script — works on Streamlit Cloud & local
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def model_path(filename):
+    return os.path.join(BASE_DIR, filename)
+
 @st.cache_resource(show_spinner=False)
 def load_all_models():
     device = torch.device("cpu")
@@ -187,7 +194,8 @@ def load_all_models():
     errors = {}
 
     # ── ML models ────────────────────────────────────────────────────
-    for name, path in [("SVM", "SVM.pkl"), ("Random Forest", "RandomForest.pkl")]:
+    for name, fname in [("SVM", "SVM.pkl"), ("Random Forest", "RandomForest.pkl")]:
+        path = model_path(fname)
         try:
             models[name] = joblib.load(path)
         except Exception as e:
@@ -200,7 +208,8 @@ def load_all_models():
         ("Transformer",           "best_transformer.pth",            TransformerModel),
         ("Transformer-Attention", "best_transformer_attention.pth",  TransformerAttentionModel),
     ]
-    for name, path, cls in dl_specs:
+    for name, fname, cls in dl_specs:
+        path = model_path(fname)
         try:
             state = torch.load(path, map_location=device, weights_only=True)
             # Handle both raw state_dict and wrapped checkpoint
