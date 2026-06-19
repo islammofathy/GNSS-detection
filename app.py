@@ -358,6 +358,74 @@ def pred_timeline(preds_svc, preds_dl):
 
 
 # ─────────────────────────────────────────────
+# RTKLIB AUTO-INSTALLER (Streamlit Cloud / Linux)
+# ─────────────────────────────────────────────
+
+RTKLIB_INSTALL_DIR = os.path.expanduser("~/.rtklib")
+RTKLIB_EXE         = os.path.join(RTKLIB_INSTALL_DIR, "rnx2rtkp")
+
+def is_rtklib_installed() -> bool:
+    return os.path.isfile(RTKLIB_EXE) and os.access(RTKLIB_EXE, os.X_OK)
+
+def install_rtklib_linux(status_placeholder) -> bool:
+    """
+    Download RTKLIB 2.4.3b34 source and compile rnx2rtkp on Linux.
+    Shows live progress in the Streamlit placeholder.
+    Returns True on success, False on failure.
+    """
+    import urllib.request, zipfile
+
+    os.makedirs(RTKLIB_INSTALL_DIR, exist_ok=True)
+
+    steps = [
+        ("📥 Downloading RTKLIB source…",
+         ["wget", "-q",
+          "https://github.com/tomojitakasu/RTKLIB/archive/refs/tags/v2.4.3b34.zip",
+          "-O", "/tmp/rtklib.zip"]),
+        ("📦 Extracting…",
+         ["unzip", "-q", "-o", "/tmp/rtklib.zip", "-d", "/tmp/"]),
+        ("🔨 Compiling rnx2rtkp…",
+         ["make", "-C", "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc", "-j2"]),
+    ]
+
+    for msg, cmd in steps:
+        status_placeholder.info(msg)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            status_placeholder.error(f"❌ Failed at: {msg}\n{result.stderr[:500]}")
+            return False
+
+    # Copy compiled binary
+    compiled = "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc/rnx2rtkp"
+    if os.path.isfile(compiled):
+        shutil.copy(compiled, RTKLIB_EXE)
+        os.chmod(RTKLIB_EXE, 0o755)
+        status_placeholder.success("✅ RTKLIB installed successfully on server!")
+        return True
+    else:
+        status_placeholder.error("❌ Compiled binary not found after build.")
+        return False
+
+
+def get_rtklib_exe(status_placeholder=None) -> str:
+    """
+    Returns path to rnx2rtkp:
+    - On Linux (Streamlit Cloud): auto-installs if needed
+    - On Windows: uses find_rnx2rtkp() (PATH or common locations)
+    """
+    if os.name == "nt":  # Windows
+        return find_rnx2rtkp()
+    else:  # Linux / Streamlit Cloud
+        if is_rtklib_installed():
+            return RTKLIB_EXE
+        if status_placeholder:
+            success = install_rtklib_linux(status_placeholder)
+            if success:
+                return RTKLIB_EXE
+        raise RuntimeError("RTKLIB could not be installed on the server.")
+
+
+# ─────────────────────────────────────────────
 # 9. NAVIGATION FILE AUTO-DOWNLOADER
 # ─────────────────────────────────────────────
 
@@ -714,11 +782,19 @@ def main():
         The converted CSV will be passed automatically to Section 1.
         """)
 
-        rtklib_path_input = st.text_input(
-            "RTKLIB rnx2rtkp.exe path (leave blank to auto-detect from PATH)",
-            value="",
-            placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
-        )
+        # Only show manual path input on Windows
+        if os.name == "nt":
+            rtklib_path_input = st.text_input(
+                "RTKLIB rnx2rtkp.exe path (leave blank to auto-detect from PATH)",
+                value="",
+                placeholder=r"e.g. C:\RTKLIB-2.4.3b34\bin\rnx2rtkp.exe",
+            )
+        else:
+            rtklib_path_input = ""
+            if is_rtklib_installed():
+                st.success("✅ RTKLIB is already installed on the server and ready to use.")
+            else:
+                st.info("🔧 RTKLIB will be automatically compiled on the server when you click **Run RTKLIB** (takes ~2 minutes on first run only).")
 
         # ── Navigation file auto-downloader ──────────────────────────
         st.markdown("---")
@@ -799,16 +875,19 @@ def main():
 
         if obs_file and nav_ready:
             if st.button("🚀 Run RTKLIB & Convert to Features", type="primary"):
-                with st.spinner("Running RTKLIB — this may take 10–60 seconds for large files…"):
+                install_status = st.empty()
+                with st.spinner("Running RTKLIB — this may take 1–3 minutes on first run (compiling on server)…"):
                     try:
+                        # ── Resolve rnx2rtkp: Windows path input OR auto-install on Linux ──
                         if rtklib_path_input.strip():
                             exe = rtklib_path_input.strip()
                             if not os.path.isfile(exe):
                                 raise FileNotFoundError(f"Not found: {exe}")
                         else:
-                            exe = find_rnx2rtkp()
+                            install_status.info("🔧 Checking RTKLIB on server…")
+                            exe = get_rtklib_exe(install_status)
 
-                        st.info(f"✅ Using RTKLIB at: `{exe}`")
+                        install_status.success(f"✅ RTKLIB ready at: `{exe}`")
 
                         with tempfile.TemporaryDirectory() as tmp:
                             # Save observation file
