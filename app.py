@@ -369,42 +369,88 @@ def is_rtklib_installed() -> bool:
 
 def install_rtklib_linux(status_placeholder) -> bool:
     """
-    Download RTKLIB 2.4.3b34 source and compile rnx2rtkp on Linux.
-    Shows live progress in the Streamlit placeholder.
-    Returns True on success, False on failure.
+    Install rnx2rtkp on Linux (Streamlit Cloud).
+    Strategy 1: apt-get install rtklib (fastest, no compile needed)
+    Strategy 2: Download prebuilt binary from GitHub releases
+    Strategy 3: Compile from source using requests (not wget)
     """
-    import urllib.request, zipfile
-
     os.makedirs(RTKLIB_INSTALL_DIR, exist_ok=True)
 
-    steps = [
-        ("📥 Downloading RTKLIB source…",
-         ["wget", "-q",
-          "https://github.com/tomojitakasu/RTKLIB/archive/refs/tags/v2.4.3b34.zip",
-          "-O", "/tmp/rtklib.zip"]),
-        ("📦 Extracting…",
-         ["unzip", "-q", "-o", "/tmp/rtklib.zip", "-d", "/tmp/"]),
-        ("🔨 Compiling rnx2rtkp…",
-         ["make", "-C", "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc", "-j2"]),
-    ]
+    # ── Strategy 1: apt-get ───────────────────────────────────────────
+    status_placeholder.info("📦 Trying to install RTKLIB via apt-get…")
+    try:
+        r = subprocess.run(
+            ["apt-get", "install", "-y", "-q", "rtklib"],
+            capture_output=True, text=True, timeout=120
+        )
+        apt_path = shutil.which("rnx2rtkp")
+        if apt_path:
+            shutil.copy(apt_path, RTKLIB_EXE)
+            os.chmod(RTKLIB_EXE, 0o755)
+            status_placeholder.success("✅ RTKLIB installed via apt-get!")
+            return True
+    except Exception:
+        pass
 
-    for msg, cmd in steps:
-        status_placeholder.info(msg)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            status_placeholder.error(f"❌ Failed at: {msg}\n{result.stderr[:500]}")
-            return False
+    # ── Strategy 2: Download prebuilt binary via requests ─────────────
+    status_placeholder.info("📥 Downloading RTKLIB source via Python requests…")
+    try:
+        import zipfile
+        zip_url = "https://github.com/tomojitakasu/RTKLIB/archive/refs/tags/v2.4.3b34.zip"
+        zip_path = "/tmp/rtklib.zip"
 
-    # Copy compiled binary
-    compiled = "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc/rnx2rtkp"
-    if os.path.isfile(compiled):
-        shutil.copy(compiled, RTKLIB_EXE)
-        os.chmod(RTKLIB_EXE, 0o755)
-        status_placeholder.success("✅ RTKLIB installed successfully on server!")
-        return True
-    else:
-        status_placeholder.error("❌ Compiled binary not found after build.")
-        return False
+        resp = requests.get(zip_url, timeout=120, stream=True)
+        if resp.status_code == 200:
+            with open(zip_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            status_placeholder.info("📦 Extracting RTKLIB source…")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall("/tmp/")
+
+            status_placeholder.info("🔨 Compiling rnx2rtkp (this takes ~2 minutes)…")
+            make_result = subprocess.run(
+                ["make", "-C", "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc", "-j2"],
+                capture_output=True, text=True, timeout=300
+            )
+            compiled = "/tmp/RTKLIB-2.4.3b34/app/rnx2rtkp/gcc/rnx2rtkp"
+            if os.path.isfile(compiled):
+                shutil.copy(compiled, RTKLIB_EXE)
+                os.chmod(RTKLIB_EXE, 0o755)
+                status_placeholder.success("✅ RTKLIB compiled and installed!")
+                return True
+            else:
+                status_placeholder.warning(f"⚠️ Compile output:\n{make_result.stderr[:300]}")
+    except Exception as e:
+        status_placeholder.warning(f"⚠️ Source compile failed: {e}")
+
+    # ── Strategy 3: git clone ─────────────────────────────────────────
+    status_placeholder.info("📥 Trying git clone as fallback…")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth=1", "--branch", "v2.4.3b34",
+             "https://github.com/tomojitakasu/RTKLIB.git", "/tmp/RTKLIB_git"],
+            capture_output=True, text=True, timeout=180
+        )
+        make_result = subprocess.run(
+            ["make", "-C", "/tmp/RTKLIB_git/app/rnx2rtkp/gcc", "-j2"],
+            capture_output=True, text=True, timeout=300
+        )
+        compiled = "/tmp/RTKLIB_git/app/rnx2rtkp/gcc/rnx2rtkp"
+        if os.path.isfile(compiled):
+            shutil.copy(compiled, RTKLIB_EXE)
+            os.chmod(RTKLIB_EXE, 0o755)
+            status_placeholder.success("✅ RTKLIB installed via git clone!")
+            return True
+    except Exception as e:
+        status_placeholder.warning(f"⚠️ Git clone failed: {e}")
+
+    status_placeholder.error(
+        "❌ All installation methods failed.\n\n"
+        "This is likely a Streamlit Cloud network restriction.\n"
+        "Please add `rtklib` to your `packages.txt` file in your GitHub repo."
+    )
+    return False
 
 
 def get_rtklib_exe(status_placeholder=None) -> str:
