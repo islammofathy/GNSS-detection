@@ -326,29 +326,63 @@ def align_features(df, target_n):
         df = df.iloc[:, :target_n]
     return df
 
-def build_ml_features(df_feat, window=WINDOW):
-    """Build (n_windows, 4*n_cols) stat features for ML models."""
+def build_ml_features(df_feat, window=WINDOW, target_features=ML_N_FEATURES):
+    """
+    Build per-window stat features for ML models.
+    Concatenates [mean, std, min, max] per column then pads/trims to target_features.
+    Uses 4 stats × n_cols. With target_features=256: expects 64 input columns (4×64=256).
+    """
     X = df_feat.values.astype(np.float32)
     rows = []
-    for i in range(0, len(X) - window, window):
-        w = X[i:i+window]
-        rows.append(np.concatenate([
-            np.mean(w, 0), np.std(w, 0), np.var(w, 0), w[-1]-w[0]
-        ]))
-    return np.array(rows, dtype=np.float32)
+    n_windows = (len(X) - window) // window + 1
+    for i in range(n_windows):
+        start = i * window
+        end   = start + window
+        if end > len(X):
+            break
+        w = X[start:end]
+        feat = np.concatenate([
+            np.mean(w, 0), np.std(w, 0),
+            np.min(w, 0),  np.max(w, 0),
+        ])
+        rows.append(feat)
+    if not rows:
+        return np.zeros((0, target_features), dtype=np.float32)
+    arr = np.array(rows, dtype=np.float32)
+    # Pad or trim to exactly target_features columns
+    if arr.shape[1] < target_features:
+        arr = np.hstack([arr, np.zeros(
+            (arr.shape[0], target_features - arr.shape[1]), dtype=np.float32)])
+    else:
+        arr = arr[:, :target_features]
+    return arr
 
-def build_sequences(df_feat, window=WINDOW):
-    """Build (n_windows, window, n_cols) sequences for DL models."""
+
+def build_sequences(df_feat, window=WINDOW, target_dim=DL_INPUT_DIM):
+    """
+    Build (n_windows, window, target_dim) sequences for DL models.
+    Uses non-overlapping windows. Pads/trims feature dimension to target_dim.
+    """
     X = df_feat.values.astype(np.float32)
-    seqs = [X[i:i+window] for i in range(0, len(X) - window, window)]
-    return np.array(seqs, dtype=np.float32)
-
-def pad_or_trim(arr, target):
-    """Ensure 2-D array has exactly `target` columns."""
-    n = arr.shape[1]
-    if n < target:
-        return np.hstack([arr, np.zeros((arr.shape[0], target - n), dtype=np.float32)])
-    return arr[:, :target]
+    seqs = []
+    n_windows = (len(X) - window) // window + 1
+    for i in range(n_windows):
+        start = i * window
+        end   = start + window
+        if end > len(X):
+            break
+        seqs.append(X[start:end])
+    if not seqs:
+        return np.zeros((0, window, target_dim), dtype=np.float32)
+    arr = np.array(seqs, dtype=np.float32)   # (n_win, window, n_cols)
+    # Pad or trim feature dimension
+    n_cols = arr.shape[2]
+    if n_cols < target_dim:
+        pad = np.zeros((arr.shape[0], window, target_dim - n_cols), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=2)
+    else:
+        arr = arr[:, :, :target_dim]
+    return arr
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -701,26 +735,6 @@ def main():
             else:
                 st.info("🔧 RTKLIB will auto-install on first run (~2 min).")
 
-        st.markdown("---")
-        st.markdown("#### 📥 Auto-download Navigation file")
-        cy, cm_, cd = st.columns(3)
-        nav_year  = cy.number_input("Year",  2000, 2030, 2023, step=1)
-        nav_month = cm_.number_input("Month", 1, 12, 10, step=1)
-        nav_day   = cd.number_input("Day",   1, 31, 5,  step=1)
-        if st.button("📥 Download Navigation File from IGS", type="secondary"):
-            with st.spinner("Downloading…"):
-                try:
-                    tmp = tempfile.mkdtemp()
-                    p   = download_nav_file(int(nav_year),int(nav_month),int(nav_day),tmp)
-                    nb  = open(p,"rb").read()
-                    st.success(f"✅ Downloaded ({len(nb)/1024:.1f} KB)")
-                    st.download_button("⬇️ Save nav file", data=nb,
-                                       file_name=os.path.basename(p),
-                                       mime="application/octet-stream")
-                    st.session_state["downloaded_nav_bytes"] = nb
-                    st.session_state["downloaded_nav_name"]  = os.path.basename(p)
-                except Exception as e:
-                    st.error(f"❌ {e}")
 
         st.markdown("---")
         st.markdown("#### 📂 Upload RINEX files")
@@ -728,14 +742,10 @@ def main():
         co, cn = st.columns(2)
         obs_file = co.file_uploader("📄 Observation (.rnx/.obs/.txt)",
                                     type=["rnx","obs","rnx3","txt"], key="rtklib_obs")
-        if st.session_state.get("downloaded_nav_bytes"):
-            cn.success(f"✅ Nav ready: `{st.session_state.get('downloaded_nav_name')}`")
-            nav_file = None
-        else:
-            nav_file = cn.file_uploader("📄 Navigation (.rnx/.nav/.txt)",
-                                        type=["nav","rnx","rnx3","txt"], key="rtklib_nav")
+        nav_file = cn.file_uploader("📄 Navigation (.rnx/.nav/.txt)",
+                                    type=["nav","rnx","rnx3","txt"], key="rtklib_nav")
 
-        nav_ready = nav_file is not None or st.session_state.get("downloaded_nav_bytes") is not None
+        nav_ready = nav_file is not None
 
         if obs_file and nav_ready:
             if st.button("🚀 Run RTKLIB & Convert to Features", type="primary"):
@@ -748,12 +758,8 @@ def main():
                         with tempfile.TemporaryDirectory() as tmp:
                             obs_path = os.path.join(tmp, obs_file.name)
                             open(obs_path,"wb").write(obs_file.read())
-                            if nav_file:
-                                nav_path = os.path.join(tmp, nav_file.name)
-                                open(nav_path,"wb").write(nav_file.read())
-                            else:
-                                nav_path = os.path.join(tmp, st.session_state["downloaded_nav_name"])
-                                open(nav_path,"wb").write(st.session_state["downloaded_nav_bytes"])
+                            nav_path = os.path.join(tmp, nav_file.name)
+                            open(nav_path,"wb").write(nav_file.read())
                             pos  = run_rnx2rtkp(obs_path, nav_path, exe, tmp)
                             pdf  = parse_pos_file(pos)
                             st.success(f"✅ {len(pdf)} epochs parsed")
@@ -841,32 +847,27 @@ def main():
 
     win = window_override
 
-    # Build ML features (256-dim)
-    ml_aligned = align_features(scaled.copy(), ML_N_FEATURES)
-    X_ml_raw   = build_ml_features(ml_aligned, window=win)
-    X_ml       = pad_or_trim(X_ml_raw, ML_N_FEATURES)
+    # Build ML features: (n_win, 256) — stats per window, padded/trimmed inside function
+    X_ml = build_ml_features(scaled, window=win, target_features=ML_N_FEATURES)
 
-    # Build DL sequences (N, 30, 55)
-    dl_aligned = align_features(scaled.copy(), DL_INPUT_DIM)
-    X_dl       = build_sequences(dl_aligned, window=win)
-    if X_dl.shape[2] != DL_INPUT_DIM:
-        pad = np.zeros((X_dl.shape[0], X_dl.shape[1], DL_INPUT_DIM - X_dl.shape[2]),
-                       dtype=np.float32)
-        X_dl = np.concatenate([X_dl, pad], axis=2) if X_dl.shape[2] < DL_INPUT_DIM \
-               else X_dl[:, :, :DL_INPUT_DIM]
+    # Build DL sequences: (n_win, win, 64) — padded/trimmed inside function
+    X_dl = build_sequences(scaled, window=win, target_dim=DL_INPUT_DIM)
 
     n_win = min(len(X_ml), len(X_dl))
     if n_win == 0:
-        st.error(f"Not enough rows for window size {win}."); st.stop()
+        st.error(f"Not enough rows for window size {win}. "
+                 f"Need at least {win*2} rows, got {len(scaled)}."); st.stop()
 
-    X_ml = X_ml[:n_win]; X_dl = X_dl[:n_win]
+    X_ml = X_ml[:n_win]
+    X_dl = X_dl[:n_win]
 
     if labels_raw is not None:
         y_win = np.array([int(np.any(labels_raw[i*win:(i+1)*win])) for i in range(n_win)])
     else:
         y_win = None
 
-    st.info(f"📊 {n_win} windows of size {win} built from {df_feat.shape[0]} rows.")
+    st.info(f"📊 {n_win} windows of size {win} built from {scaled.shape[0]} rows · "
+            f"ML input: {X_ml.shape} · DL input: {X_dl.shape}")
 
     # ── Run all models ────────────────────────────────────────────────
     results = {}
