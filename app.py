@@ -389,17 +389,44 @@ def build_sequences(df_feat, window=WINDOW, target_dim=DL_INPUT_DIM):
 # 6. INFERENCE
 # ═══════════════════════════════════════════════════════════════════════════
 def predict_ml(model, X):
-    preds = model.predict(X)
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)[:, 1]
-    elif hasattr(model, "decision_function"):
-        raw   = model.decision_function(X)
-        proba = 1 / (1 + np.exp(-raw))
+    """
+    Run ML model inference. Handles both binary and multi-class (7-class) models.
+    Returns binary preds (0=clean, 1=spoofed) and P(spoofed) probability.
+    """
+    raw_preds = model.predict(X)
+    n_classes = len(model.classes_) if hasattr(model, "classes_") else 2
+
+    if n_classes == 2:
+        # Binary: class 0=clean, 1=spoofed
+        binary_preds = raw_preds.astype(int)
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)[:, 1]
+        elif hasattr(model, "decision_function"):
+            raw = model.decision_function(X)
+            proba = 1 / (1 + np.exp(-raw if raw.ndim == 1 else raw[:, 1]))
+        else:
+            proba = binary_preds.astype(float)
     else:
-        proba = preds.astype(float)
-    return preds.astype(int), proba.astype(float)
+        # Multi-class (7 classes): class 0=clean, 1-6=spoofed variants
+        # Binary: any non-zero prediction = spoofed
+        binary_preds = (raw_preds != 0).astype(int)
+        if hasattr(model, "predict_proba"):
+            proba_all = model.predict_proba(X)   # (n, 7)
+            proba = 1.0 - proba_all[:, 0]        # P(spoofed) = 1 - P(clean)
+        elif hasattr(model, "decision_function"):
+            df_ = model.decision_function(X)
+            proba = binary_preds.astype(float)
+        else:
+            proba = binary_preds.astype(float)
+
+    return binary_preds.astype(int), proba.astype(float)
+
 
 def predict_dl(model, X, device):
+    """
+    Run DL model inference. Handles both binary and multi-class (7-class) models.
+    Returns binary preds (0=clean, 1=spoofed) and P(spoofed) probability.
+    """
     model.eval()
     t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -410,9 +437,9 @@ def predict_dl(model, X, device):
         preds = (probs[:, 1] > 0.5).astype(int)
         proba = probs[:, 1]
     else:
-        # Multi-class: class 0 = clean, 1+ = spoofed
-        preds = (np.argmax(probs, axis=1) > 0).astype(int)
-        proba = 1.0 - probs[:, 0]
+        # Multi-class: class 0=clean, 1-6=spoofed variants
+        preds = (np.argmax(probs, axis=1) != 0).astype(int)
+        proba = 1.0 - probs[:, 0]   # P(spoofed) = 1 - P(clean)
     return preds.astype(int), proba.astype(float)
 
 
