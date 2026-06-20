@@ -865,6 +865,18 @@ def main():
     if df_feat.shape[1] == 0:
         st.error("No numeric feature columns found."); st.stop()
 
+    # ── Drop constant/identifier columns that were excluded during training ──
+    # Training used 64 features = 8 channels × 8 features
+    # Dropped: channel_id, tracking_flag, sampling_freq (constant per channel)
+    DROP_SUFFIXES = ["channel_id", "tracking_flag", "sampling_freq"]
+    cols_to_drop = [c for c in df_feat.columns
+                    if any(c.endswith(s) for s in DROP_SUFFIXES)]
+    if cols_to_drop:
+        df_feat = df_feat.drop(columns=cols_to_drop)
+
+    st.info(f"ℹ️ Using {df_feat.shape[1]} features after dropping constant columns "
+            f"({len(cols_to_drop)} dropped: channel_id, tracking_flag, sampling_freq)")
+
     scaler = StandardScaler()
     scaled = pd.DataFrame(scaler.fit_transform(df_feat), columns=df_feat.columns)
 
