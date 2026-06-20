@@ -250,11 +250,38 @@ def load_all_models():
                 errors[name] = f"Unknown format: {type(raw).__name__}"
                 continue
 
-            # Instantiate and load — show real mismatch errors
+            # Instantiate architecture and load weights
             m = cls()
-            result = m.load_state_dict(state_dict, strict=True)
-            m.eval()
-            models[name] = m
+            try:
+                m.load_state_dict(state_dict, strict=True)
+                m.eval()
+                models[name] = m
+            except RuntimeError:
+                # CNN-LSTM: auto-detect exact dims from checkpoint tensors
+                if name == "CNN-LSTM":
+                    ck_keys     = list(state_dict.keys())
+                    has_reverse = any("reverse" in k for k in ck_keys)
+                    ih   = state_dict.get("lstm.weight_ih_l0")
+                    fc_w = state_dict.get("fc.weight")
+                    if ih is not None and fc_w is not None:
+                        hidden_dim = ih.shape[0] // 4
+                        fc_in      = fc_w.shape[1]
+                        fc_out     = fc_w.shape[0]
+                        m2 = CNNLSTMModel.__new__(CNNLSTMModel)
+                        nn.Module.__init__(m2)
+                        m2.conv1   = nn.Conv1d(64, 64, 3, padding=1)
+                        m2.relu    = nn.ReLU()
+                        m2.dropout = nn.Dropout(0.3)
+                        m2.lstm    = nn.LSTM(64, hidden_dim, num_layers=1,
+                                            batch_first=True, bidirectional=has_reverse)
+                        m2.fc      = nn.Linear(fc_in, fc_out)
+                        m2.load_state_dict(state_dict, strict=True)
+                        m2.eval()
+                        models[name] = m2
+                    else:
+                        errors[name] = f"CNN-LSTM: keys={ck_keys[:6]} has_reverse={has_reverse}"
+                else:
+                    raise
 
         except Exception as e:
             errors[name] = f"{type(e).__name__}: {str(e)[:300]}"
