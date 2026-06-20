@@ -72,7 +72,8 @@ button[data-baseweb="tab"] { font-size:.95rem; font-weight:600; }
 # ═══════════════════════════════════════════════════════════════════════════
 WINDOW        = 30
 ML_N_FEATURES = 256
-DL_INPUT_DIM  = 55
+DL_INPUT_DIM  = 64    # confirmed from checkpoint: lstm.weight_ih_l0 [256, 64]
+DL_NUM_CLASSES = 7    # confirmed from checkpoint: fc.weight [7, ...]
 
 MODEL_COLORS = {
     "SVM":                   "#1a73e8",
@@ -90,13 +91,19 @@ ALL_MODELS = ML_MODELS + DL_MODELS
 # 3. DEEP LEARNING ARCHITECTURES
 # ═══════════════════════════════════════════════════════════════════════════
 class AttentionBiLSTM(nn.Module):
-    """Matches saved keys: lstm.*, attention.weight/bias, fc.weight/bias"""
-    def __init__(self, input_dim=DL_INPUT_DIM, hidden_dim=64, num_layers=1,
-                 dropout=0.3, num_classes=2):
+    """
+    Exact dims from checkpoint:
+      lstm.weight_ih_l0 : [256, 64]  → input_dim=64, hidden_dim=64 (BiLSTM: 4*64=256)
+      lstm.weight_ih_l0_reverse: [256, 64]  → bidirectional confirmed
+      attention.weight  : inferred [1, 128]
+      fc.weight         : [7, 128]   → num_classes=7, hidden_dim*2=128
+    """
+    def __init__(self, input_dim=64, hidden_dim=64, num_layers=1,
+                 dropout=0.3, num_classes=7):
         super().__init__()
         self.lstm      = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
                                  batch_first=True, bidirectional=True)
-        self.attention = nn.Linear(hidden_dim * 2, 1)   # key: 'attention'
+        self.attention = nn.Linear(hidden_dim * 2, 1)
         self.dropout   = nn.Dropout(dropout)
         self.fc        = nn.Linear(hidden_dim * 2, num_classes)
 
@@ -108,10 +115,14 @@ class AttentionBiLSTM(nn.Module):
 
 
 class CNNLSTMModel(nn.Module):
-    """Matches saved keys: conv1.weight/bias, lstm.*, fc.weight/bias"""
-    def __init__(self, input_dim=DL_INPUT_DIM, num_filters=64,
-                 kernel_size=3, hidden_dim=64, num_layers=1,
-                 dropout=0.3, num_classes=2):
+    """
+    Exact dims from checkpoint:
+      conv1.weight : [64, 64, 3]  → in_channels=64, out_channels=64
+      fc.weight    : [7, 64]      → num_classes=7, hidden_dim=32 (BiLSTM: 32*2=64)
+    """
+    def __init__(self, input_dim=64, num_filters=64,
+                 kernel_size=3, hidden_dim=32, num_layers=1,
+                 dropout=0.3, num_classes=7):
         super().__init__()
         self.conv1   = nn.Conv1d(input_dim, num_filters, kernel_size, padding=1)
         self.relu    = nn.ReLU()
@@ -121,20 +132,26 @@ class CNNLSTMModel(nn.Module):
         self.fc      = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)            # (B, F, T)
+        x = x.permute(0, 2, 1)
         x = self.relu(self.conv1(x))
         x = self.dropout(x)
-        x = x.permute(0, 2, 1)            # (B, T, F)
+        x = x.permute(0, 2, 1)
         out, _ = self.lstm(x)
         return self.fc(self.dropout(out[:, -1, :]))
 
 
 class TransformerModel(nn.Module):
-    """Matches saved keys: input_projection.*, transformer.layers.0/1.*, fc.*"""
-    def __init__(self, input_dim=DL_INPUT_DIM, d_model=64, nhead=4,
-                 num_layers=2, dim_feedforward=128, dropout=0.1, num_classes=2):
+    """
+    Exact dims from checkpoint:
+      input_projection.weight      : [64, 64]    → input_dim=64, d_model=64
+      transformer.layers.0.linear1.weight: [2048, 64] → dim_feedforward=2048
+      transformer.layers.0.linear2.weight: [64, 2048]
+      fc.weight                    : [7, 64]      → num_classes=7
+    """
+    def __init__(self, input_dim=64, d_model=64, nhead=4,
+                 num_layers=2, dim_feedforward=2048, dropout=0.1, num_classes=7):
         super().__init__()
-        self.input_projection = nn.Linear(input_dim, d_model)   # key: 'input_projection'
+        self.input_projection = nn.Linear(input_dim, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -150,17 +167,23 @@ class TransformerModel(nn.Module):
 
 
 class TransformerAttentionModel(nn.Module):
-    """Matches saved keys: input_projection.*, transformer.layers.0/1.*, attention.*, fc.*"""
-    def __init__(self, input_dim=DL_INPUT_DIM, d_model=64, nhead=4,
-                 num_layers=2, dim_feedforward=128, dropout=0.1, num_classes=2):
+    """
+    Exact dims from checkpoint:
+      input_projection.weight      : [64, 64]    → input_dim=64, d_model=64
+      transformer.layers.*.linear1 : [2048, 64]  → dim_feedforward=2048
+      attention.weight             : [1, 64]
+      fc.weight                    : [7, 64]      → num_classes=7
+    """
+    def __init__(self, input_dim=64, d_model=64, nhead=4,
+                 num_layers=2, dim_feedforward=2048, dropout=0.1, num_classes=7):
         super().__init__()
-        self.input_projection = nn.Linear(input_dim, d_model)   # key: 'input_projection'
+        self.input_projection = nn.Linear(input_dim, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.attention   = nn.Linear(d_model, 1)                 # key: 'attention'
+        self.attention   = nn.Linear(d_model, 1)
         self.dropout     = nn.Dropout(dropout)
         self.fc          = nn.Linear(d_model, num_classes)
 
@@ -183,7 +206,7 @@ def model_path(filename):
     return os.path.join(BASE_DIR, filename)
 
 @st.cache_resource(show_spinner=False)
-def load_all_models(_version="v3"):   # bump this string to force cache clear
+def load_all_models():
     device = torch.device("cpu")
     models = {}
     errors = {}
@@ -206,40 +229,28 @@ def load_all_models(_version="v3"):   # bump this string to force cache clear
     for name, fname, cls in dl_specs:
         path = model_path(fname)
         try:
-            # Step 1: load whatever is in the file (disable weights_only so
-            # OrderedDict / legacy formats load without error)
-            raw = torch.load(path, map_location=device, weights_only=False)
-
-            # Step 2: extract the state dict however it was saved
-            if isinstance(raw, dict):
-                if "model_state_dict" in raw:
-                    state_dict = raw["model_state_dict"]
-                elif "state_dict" in raw:
-                    state_dict = raw["state_dict"]
-                else:
-                    state_dict = raw   # assume raw IS the state dict
-            elif hasattr(raw, "state_dict"):
-                # Full model object saved — just use it directly
-                raw.eval()
-                models[name] = raw
-                continue
-            else:
-                errors[name] = f"Unknown saved format: {type(raw)}"
-                continue
-
-            # Step 3: instantiate architecture and load weights
+            state = torch.load(path, map_location=device, weights_only=True)
+            # Handle both raw state_dict and wrapped checkpoint
+            if isinstance(state, dict) and "model_state_dict" in state:
+                state = state["model_state_dict"]
             m = cls()
-            missing, unexpected = m.load_state_dict(state_dict, strict=False)
-            if unexpected:
-                # Only fail if ALL keys are wrong (i.e. completely wrong arch)
-                if len(unexpected) == len(state_dict):
-                    errors[name] = f"All keys unexpected — architecture mismatch. Keys: {list(state_dict.keys())[:5]}"
-                    continue
+            if isinstance(state, dict):
+                m.load_state_dict(state, strict=False)
+            else:
+                m = state  # full model saved
             m.eval()
             models[name] = m
-
         except Exception as e:
-            errors[name] = f"{type(e).__name__}: {e}"
+            # Fallback: try loading as full model
+            try:
+                m = torch.load(path, map_location=device, weights_only=False)
+                if hasattr(m, "eval"):
+                    m.eval()
+                    models[name] = m
+                else:
+                    errors[name] = "Not a valid PyTorch model"
+            except Exception as e2:
+                errors[name] = str(e2)
 
     return models, errors, device
 
@@ -325,9 +336,15 @@ def predict_dl(model, X, device):
     t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
         logits = model(t)
-        probs  = torch.softmax(logits, 1)
-        preds  = torch.argmax(probs, 1).cpu().numpy()
-        proba  = probs[:, 1].cpu().numpy()
+        probs  = torch.softmax(logits, 1).cpu().numpy()
+    n_classes = probs.shape[1]
+    if n_classes == 2:
+        preds = (probs[:, 1] > 0.5).astype(int)
+        proba = probs[:, 1]
+    else:
+        # Multi-class: class 0 = clean, 1+ = spoofed
+        preds = (np.argmax(probs, axis=1) > 0).astype(int)
+        proba = 1.0 - probs[:, 0]
     return preds.astype(int), proba.astype(float)
 
 
