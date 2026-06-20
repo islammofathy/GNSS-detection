@@ -229,28 +229,33 @@ def load_all_models():
     for name, fname, cls in dl_specs:
         path = model_path(fname)
         try:
-            state = torch.load(path, map_location=device, weights_only=True)
-            # Handle both raw state_dict and wrapped checkpoint
-            if isinstance(state, dict) and "model_state_dict" in state:
-                state = state["model_state_dict"]
-            m = cls()
-            if isinstance(state, dict):
-                m.load_state_dict(state, strict=False)
+            # Load without weights_only restriction so OrderedDict works
+            raw = torch.load(path, map_location=device, weights_only=False)
+
+            # Extract state dict from any wrapper format
+            if isinstance(raw, dict):
+                if "model_state_dict" in raw:
+                    state_dict = raw["model_state_dict"]
+                elif "state_dict" in raw:
+                    state_dict = raw["state_dict"]
+                else:
+                    state_dict = raw
+            elif hasattr(raw, "state_dict"):
+                raw.eval()
+                models[name] = raw
+                continue
             else:
-                m = state  # full model saved
+                errors[name] = f"Unknown format: {type(raw).__name__}"
+                continue
+
+            # Instantiate and load — show real mismatch errors
+            m = cls()
+            result = m.load_state_dict(state_dict, strict=True)
             m.eval()
             models[name] = m
+
         except Exception as e:
-            # Fallback: try loading as full model
-            try:
-                m = torch.load(path, map_location=device, weights_only=False)
-                if hasattr(m, "eval"):
-                    m.eval()
-                    models[name] = m
-                else:
-                    errors[name] = "Not a valid PyTorch model"
-            except Exception as e2:
-                errors[name] = str(e2)
+            errors[name] = f"{type(e).__name__}: {str(e)[:300]}"
 
     return models, errors, device
 
