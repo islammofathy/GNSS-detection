@@ -118,18 +118,20 @@ class CNNLSTMModel(nn.Module):
     """
     Exact dims from checkpoint:
       conv1.weight : [64, 64, 3]  → in_channels=64, out_channels=64
-      fc.weight    : [7, 64]      → num_classes=7, hidden_dim=32 (BiLSTM: 32*2=64)
+      lstm.weight_ih_l0: [256, 64] → 4*hidden=256, hidden_dim=64, input=64 (conv output)
+      lstm is UNIDIRECTIONAL (no _reverse keys in saved model → bidirectional=False)
+      fc.weight    : [7, 64]      → num_classes=7, hidden_dim=64
     """
     def __init__(self, input_dim=64, num_filters=64,
-                 kernel_size=3, hidden_dim=32, num_layers=1,
+                 kernel_size=3, hidden_dim=64, num_layers=1,
                  dropout=0.3, num_classes=7):
         super().__init__()
         self.conv1   = nn.Conv1d(input_dim, num_filters, kernel_size, padding=1)
         self.relu    = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         self.lstm    = nn.LSTM(num_filters, hidden_dim, num_layers=num_layers,
-                               batch_first=True, bidirectional=True)
-        self.fc      = nn.Linear(hidden_dim * 2, num_classes)
+                               batch_first=True, bidirectional=False)  # ← unidirectional
+        self.fc      = nn.Linear(hidden_dim, num_classes)              # ← hidden_dim not *2
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
