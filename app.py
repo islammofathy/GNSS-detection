@@ -930,63 +930,81 @@ def main():
     if not results:
         st.error("All model inferences failed."); st.stop()
 
+    # ── CONSENSUS VERDICT BANNER ─────────────────────────────────────
+    votes_spoof = sum(1 for res in results.values() if res["preds"].mean() > 0.4)
+    votes_clean = len(results) - votes_spoof
+    consensus   = votes_spoof > votes_clean
+    avg_prob    = np.mean([res["proba"].mean() for res in results.values()]) * 100
+
+    if consensus:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#c0392b,#e74c3c);
+                    color:white;padding:24px 28px;border-radius:14px;
+                    font-size:1.4rem;font-weight:700;text-align:center;margin:16px 0;">
+            🔴 GNSS SPOOFING DETECTED<br>
+            <span style="font-size:1rem;font-weight:400;opacity:.9;">
+            {votes_spoof}/{len(results)} models agree · Avg spoofing probability: {avg_prob:.1f}%
+            </span>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1a7a4a,#27ae60);
+                    color:white;padding:24px 28px;border-radius:14px;
+                    font-size:1.4rem;font-weight:700;text-align:center;margin:16px 0;">
+            🟢 SIGNAL APPEARS CLEAN<br>
+            <span style="font-size:1rem;font-weight:400;opacity:.9;">
+            {votes_clean}/{len(results)} models agree · Avg spoofing probability: {avg_prob:.1f}%
+            </span>
+        </div>""", unsafe_allow_html=True)
+
     # ── Summary table ─────────────────────────────────────────────────
-    st.markdown("### 📋 Results Summary")
+    st.markdown("### 📋 Per-Model Results")
     summary_rows = []
     for name, res in results.items():
         spoof_n   = int(res["preds"].sum())
         spoof_pct = 100 * res["preds"].mean()
-        avg_prob  = 100 * res["proba"].mean()
-        verdict   = "🔴 SPOOFING DETECTED" if spoof_pct > 40 else "🟢 Clean"
+        avg_p     = 100 * res["proba"].mean()
+        verdict   = "🔴 Spoofing" if spoof_pct > 40 else "🟢 Clean"
         summary_rows.append({
-            "Model":               name,
-            "Verdict":             verdict,
-            "Spoofing Prob (%)":   f"{avg_prob:.1f}%",
-            "Spoofed Windows":     f"{spoof_n} / {n_win}",
-            "Spoofed %":           f"{spoof_pct:.1f}%",
+            "Model":             name,
+            "Verdict":           verdict,
+            "Spoofed Windows":   f"{spoof_n} / {n_win}",
+            "Spoofed %":         f"{spoof_pct:.1f}%",
+            "Avg P(Spoofed)":    f"{avg_p:.1f}%",
         })
     st.dataframe(pd.DataFrame(summary_rows).set_index("Model"),
                  use_container_width=True)
 
-    # ── Per-model metric cards ────────────────────────────────────────
-    cols = st.columns(min(3, len(results)))
+    # ── Per-model cards ───────────────────────────────────────────────
+    cols = st.columns(3)
     for i, (name, res) in enumerate(results.items()):
         with cols[i % 3]:
             spoof_pct = 100 * res["preds"].mean()
-            st.metric(
-                label=name,
-                value=f"{res['preds'].sum()} / {n_win} spoofed",
-                delta=f"{spoof_pct:.1f}%",
-            )
-            color = "alert-spoof" if spoof_pct > 40 else "alert-clean"
-            verdict = "🔴 SPOOFING DETECTED" if spoof_pct > 40 else "🟢 Clean"
-            st.markdown(f'<span class="{color}">{verdict}</span>', unsafe_allow_html=True)
+            verdict   = "🔴 SPOOFING" if spoof_pct > 40 else "🟢 Clean"
+            color     = "alert-spoof" if spoof_pct > 40 else "alert-clean"
+            st.metric(label=name,
+                      value=f"{res['preds'].sum()} / {n_win}",
+                      delta=f"{spoof_pct:.1f}% spoofed")
+            st.markdown(f'<span class="{color}">{verdict}</span>',
+                        unsafe_allow_html=True)
 
-    # ── SECTION 4 — Comparison ───────────────────────────────────────
-    st.markdown('<div class="section-header">📊 Section 4 — Model Comparison</div>',
+    # ── SECTION 4 — Analysis ──────────────────────────────────────────
+    st.markdown('<div class="section-header">📊 Section 4 — Analysis</div>',
                 unsafe_allow_html=True)
 
-    tab_metrics, tab_cm, tab_prob, tab_timeline, tab_best, tab_export = st.tabs([
-        "📈 Metrics", "🗺️ Confusion Matrices",
-        "📉 Probabilities", "📋 Timeline",
-        "🏆 Best Model", "⬇️ Export",
-    ])
+    # Only show tabs that always work (no label required)
+    if y_win is not None and len(np.unique(y_win)) > 1:
+        tabs = st.tabs(["📈 Metrics", "🗺️ Confusion Matrices",
+                        "📉 Probabilities", "📋 Timeline", "⬇️ Export"])
+        tab_metrics, tab_cm, tab_prob, tab_timeline, tab_export = tabs
 
-    # ── Metrics Tab ──────────────────────────────────────────────────
-    with tab_metrics:
-        if y_win is not None and len(np.unique(y_win)) > 1:
-            metrics_list = []
-            for name, res in results.items():
-                metrics_list.append(
-                    compute_metrics(y_win, res["preds"], res["proba"], name))
-
+        with tab_metrics:
+            metrics_list = [compute_metrics(y_win, res["preds"], res["proba"], n)
+                            for n, res in results.items()]
             mdf = pd.DataFrame(metrics_list).set_index("model")
-            st.dataframe(
-                (mdf * 100).round(2).astype(str).add(" %"),
-                use_container_width=True,
-            )
+            st.dataframe((mdf * 100).round(2).astype(str).add(" %"),
+                         use_container_width=True)
 
-            # Bar chart
             metric_names = ["accuracy","f1","precision","recall","auc_roc"]
             fig_bar = go.Figure()
             for m in metrics_list:
@@ -998,13 +1016,19 @@ def main():
                     text=[f"{m[mn]*100:.1f}%" for mn in metric_names],
                     textposition="outside",
                 ))
-            fig_bar.update_layout(
-                barmode="group", title="All-Model Metric Comparison",
-                yaxis=dict(range=[0,1.2]), height=420,
-                margin=dict(t=50,b=20), legend=dict(orientation="h"),
-            )
+            fig_bar.update_layout(barmode="group", title="Metric Comparison",
+                                  yaxis=dict(range=[0,1.2]), height=420,
+                                  margin=dict(t=50,b=20), legend=dict(orientation="h"))
             st.plotly_chart(fig_bar, use_container_width=True)
             st.plotly_chart(metric_radar(metrics_list), use_container_width=True)
+
+            # Best model
+            best = max(metrics_list, key=lambda m: m["f1"])
+            st.markdown(f"""
+            <div class="winner-banner">
+                🏆 Best Model: {best['model']} &nbsp;|&nbsp;
+                F1 = {best['f1']*100:.1f}% · Accuracy = {best['accuracy']*100:.1f}%
+            </div>""", unsafe_allow_html=True)
 
             with st.expander("📄 Classification Reports"):
                 for name, res in results.items():
@@ -1012,84 +1036,68 @@ def main():
                     st.text(classification_report(y_win, res["preds"],
                                                   target_names=["Clean","Spoofed"],
                                                   zero_division=0))
-        else:
-            st.info("Add a `label` column to your CSV to see accuracy metrics.")
 
-    # ── Confusion Matrices Tab ───────────────────────────────────────
-    with tab_cm:
-        if y_win is not None and len(np.unique(y_win)) > 1:
+        with tab_cm:
             names = list(results.keys())
             for row_start in range(0, len(names), 3):
                 cols_ = st.columns(3)
                 for j, name in enumerate(names[row_start:row_start+3]):
                     with cols_[j]:
-                        res = results[name]
                         st.plotly_chart(
-                            confusion_heatmap(y_win, res["preds"], name),
-                            use_container_width=True,
-                        )
-        else:
-            st.info("Confusion matrices require a `label` column.")
+                            confusion_heatmap(y_win, results[name]["preds"], name),
+                            use_container_width=True)
 
-    # ── Probabilities Tab ────────────────────────────────────────────
-    with tab_prob:
-        st.plotly_chart(proba_hist_fig(results), use_container_width=True)
-        st.plotly_chart(proba_timeline_fig(results), use_container_width=True)
+        with tab_prob:
+            st.plotly_chart(proba_hist_fig(results), use_container_width=True)
+            st.plotly_chart(proba_timeline_fig(results), use_container_width=True)
 
-    # ── Timeline Tab ─────────────────────────────────────────────────
-    with tab_timeline:
-        st.plotly_chart(pred_timeline_fig(results), use_container_width=True)
+        with tab_timeline:
+            st.plotly_chart(pred_timeline_fig(results), use_container_width=True)
 
-    # ── Best Model Tab ───────────────────────────────────────────────
-    with tab_best:
-        if y_win is not None and len(np.unique(y_win)) > 1:
-            metrics_list = [compute_metrics(y_win, res["preds"], res["proba"], name)
-                            for name, res in results.items()]
-            best = max(metrics_list, key=lambda m: m["f1"])
-            st.markdown(f"""
-            <div class="winner-banner">
-                🏆 Best Model: {best['model']}<br>
-                <span style="font-size:.9rem;font-weight:400">
-                F1 = {best['f1']*100:.1f}% · Accuracy = {best['accuracy']*100:.1f}%
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown("#### Best Model Metrics")
-            best_df = pd.DataFrame([{
-                "Accuracy":  f"{best['accuracy']*100:.2f}%",
-                "Precision": f"{best['precision']*100:.2f}%",
-                "Recall":    f"{best['recall']*100:.2f}%",
-                "F1 Score":  f"{best['f1']*100:.2f}%",
-                "ROC-AUC":   f"{best['auc_roc']*100:.2f}%",
-            }])
-            st.dataframe(best_df, use_container_width=True)
-        else:
-            st.info("Best model selection requires a `label` column.")
+        with tab_export:
+            export = {"Window": list(range(n_win)),
+                      "True Label": ["Spoofed" if y else "Clean" for y in y_win]}
+            for name, res in results.items():
+                safe = name.replace(" ","_").replace("-","_")
+                export[f"{safe}_Prediction"] = ["Spoofed" if p else "Clean"
+                                                for p in res["preds"]]
+                export[f"{safe}_Probability"] = res["proba"].round(4)
+            export_df = pd.DataFrame(export)
+            st.dataframe(export_df, use_container_width=True, height=400)
+            st.download_button("⬇️ Download All Predictions CSV",
+                               data=export_df.to_csv(index=False).encode(),
+                               file_name="all_predictions.csv", mime="text/csv")
 
-    # ── Export Tab ───────────────────────────────────────────────────
-    with tab_export:
-        export = {"Window": list(range(n_win))}
-        if y_win is not None:
-            export["True Label"] = ["Spoofed" if y else "Clean" for y in y_win]
-        for name, res in results.items():
-            safe = name.replace(" ","_").replace("-","_")
-            export[f"{safe}_Prediction"] = ["Spoofed" if p else "Clean"
-                                            for p in res["preds"]]
-            export[f"{safe}_Probability"] = res["proba"].round(4)
-        export_df = pd.DataFrame(export)
-        st.dataframe(export_df, use_container_width=True, height=400)
-        st.download_button(
-            "⬇️ Download All Predictions CSV",
-            data=export_df.to_csv(index=False).encode(),
-            file_name="all_predictions.csv",
-            mime="text/csv",
-        )
+    else:
+        # No labels — show only probability and timeline analysis
+        tabs = st.tabs(["📉 Probabilities", "📋 Timeline", "⬇️ Export"])
+        tab_prob, tab_timeline, tab_export = tabs
+
+        with tab_prob:
+            st.plotly_chart(proba_hist_fig(results), use_container_width=True)
+            st.plotly_chart(proba_timeline_fig(results), use_container_width=True)
+
+        with tab_timeline:
+            st.plotly_chart(pred_timeline_fig(results), use_container_width=True)
+
+        with tab_export:
+            export = {"Window": list(range(n_win))}
+            for name, res in results.items():
+                safe = name.replace(" ","_").replace("-","_")
+                export[f"{safe}_Prediction"] = ["Spoofed" if p else "Clean"
+                                                for p in res["preds"]]
+                export[f"{safe}_Probability"] = res["proba"].round(4)
+            export_df = pd.DataFrame(export)
+            st.dataframe(export_df, use_container_width=True, height=400)
+            st.download_button("⬇️ Download All Predictions CSV",
+                               data=export_df.to_csv(index=False).encode(),
+                               file_name="all_predictions.csv", mime="text/csv")
 
     st.markdown("---")
     st.caption(
         "GNSS Spoofing Detection · 6-Model Comparison · "
-        "ML: SVM, Random Forest (256 features) · "
-        "DL: Attention-BiLSTM, CNN-LSTM, Transformer, Transformer-Attention (30×55 sequences)"
+        "ML: SVM, Random Forest · "
+        "DL: Attention-BiLSTM, CNN-LSTM, Transformer, Transformer-Attention"
     )
 
 
